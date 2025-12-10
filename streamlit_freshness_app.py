@@ -1351,10 +1351,110 @@ def show_freshness_analysis():
         st.exception(e)
 
 
+def process_single_run_lightweight(api_base: str, api_key: str, account_id: str, run_id: int, 
+                                    run_created: str, job_id: str = None, job_name: str = None, 
+                                    run_status: int = None):
+    """
+    Lightweight version: Only fetches run_results and minimal manifest data for waste analysis.
+    
+    Does NOT fetch freshness configs or process sources - much faster!
+    
+    Args:
+        api_base: dbt Cloud API base URL
+        api_key: dbt Cloud API key
+        account_id: dbt Cloud account ID
+        run_id: Run ID to process
+        run_created: Run created timestamp
+        job_id: Job definition ID (optional)
+        job_name: Job name (optional)
+        run_status: Run invocation status code (optional)
+    """
+    try:
+        headers = {'Authorization': f'Token {api_key}'}
+        
+        # Fetch run_results.json only
+        run_results_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/run_results.json'
+        response = requests.get(run_results_url, headers=headers)
+        response.raise_for_status()
+        run_results = response.json()
+        
+        # Fetch minimal manifest data (only nodes for materialization lookup)
+        manifest_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/manifest.json'
+        response = requests.get(manifest_url, headers=headers)
+        response.raise_for_status()
+        manifest = response.json()
+        
+        models = []
+        for result in run_results.get('results', []):
+            unique_id = result.get('unique_id')
+            
+            # Only process models (not sources, tests, etc.)
+            if not unique_id or not unique_id.startswith('model.'):
+                continue
+            
+            # Get node info
+            node = manifest.get('nodes', {}).get(unique_id, {})
+            resource_type = node.get('resource_type')
+            
+            if resource_type != 'model':
+                continue
+            
+            # Get status and execution details
+            status = result.get('status')
+            execution_time = result.get('execution_time', 0)
+            
+            # Get timing
+            timing = result.get('timing', [])
+            started_at = None
+            completed_at = None
+            for t in timing:
+                if t.get('name') == 'execute':
+                    started_at = t.get('started_at')
+                    completed_at = t.get('completed_at')
+                    break
+            
+            # Get rows affected and materialization
+            adapter_response = result.get('adapter_response', {})
+            rows_affected = adapter_response.get('rows_affected')
+            materialization = node.get('config', {}).get('materialized')
+            
+            model_data = {
+                'unique_id': unique_id,
+                'name': unique_id.split('.')[-1] if unique_id else 'unknown',
+                'resource_type': resource_type,
+                'status': status,
+                'execution_time': execution_time,
+                'started_at': started_at,
+                'completed_at': completed_at,
+                'rows_affected': rows_affected,
+                'materialization': materialization,
+                'adapter_response': adapter_response,
+                'message': result.get('message'),
+                'run_id': run_id,
+                'run_created_at': run_created,
+                'job_id': job_id,
+                'job_name': job_name,
+                'run_status': run_status
+            }
+            models.append(model_data)
+        
+        return {
+            'run_id': run_id,
+            'success': True,
+            'models': models,
+            'job_id': job_id,
+            'job_name': job_name,
+            'run_status': run_status
+        }
+        
+    except Exception as e:
+        return {'run_id': run_id, 'success': False, 'error': str(e)}
+
+
 def process_single_run(api_base: str, api_key: str, account_id: str, run_id: int, run_created: str, 
                        job_id: str = None, job_name: str = None, run_status: int = None):
     """
-    Process a single run to extract model status data.
+    Process a single run to extract model status data (includes freshness configs).
     
     This function is designed to be called in parallel for multiple runs.
     
@@ -2958,7 +3058,7 @@ def show_pre_sao_waste_analysis():
                 end_datetime,
                 environment_id=config.get('environment_id'),
                 status=[10],  # Success only for waste analysis
-                limit=max_runs * 10,  # Fetch more since we're getting all jobs
+                limit=max_runs,  # Use slider value directly - all runs have waste data
                 progress_callback=update_progress
             )
             
@@ -3116,7 +3216,7 @@ def show_pre_sao_waste_analysis():
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_run = {
                 executor.submit(
-                    process_single_run,
+                    process_single_run_lightweight,  # Use lightweight version - no freshness configs needed!
                     config['api_base'],
                     config['api_key'],
                     config['account_id'],
