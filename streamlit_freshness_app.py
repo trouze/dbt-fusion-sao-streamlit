@@ -161,6 +161,175 @@ def get_status_name(status):
     return status
 
 
+def get_all_runs_by_date(api_base: str, api_key: str, account_id: str, 
+                          start_datetime: datetime, end_datetime: datetime,
+                          environment_id: str = None, status: List[int] = None, limit: int = 500,
+                          progress_callback=None):
+    """
+    Fetch runs across ALL jobs in a date range using API-native date filtering.
+    
+    Args:
+        api_base: dbt Cloud API base URL
+        api_key: dbt Cloud API key
+        account_id: dbt Cloud account ID
+        start_datetime: Start of date range
+        end_datetime: End of date range
+        environment_id: Optional environment ID to filter
+        status: Optional list of status codes to filter by
+        limit: Max total runs to fetch
+        progress_callback: Optional callback(message, count) for progress updates
+    
+    Returns:
+        List of run objects (from all jobs, including deleted jobs)
+    """
+    url = f'{api_base}/api/v2/accounts/{account_id}/runs/'
+    headers = {'Authorization': f'Token {api_key}'}
+    
+    API_MAX_LIMIT = 100
+    all_runs = []
+    seen_run_ids = set()
+    
+    # If no status filter specified, default to success only
+    if status is None:
+        status = [10]
+    
+    # Format datetimes for API (ISO 8601 with Z timezone)
+    start_iso = start_datetime.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_iso = end_datetime.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    for status_code in status:
+        offset = 0
+        page_num = 0
+        
+        while len(all_runs) < limit:
+            page_limit = min(API_MAX_LIMIT, limit - len(all_runs))
+            page_num += 1
+            
+            if progress_callback:
+                progress_callback(f"Fetching runs (page {page_num}, found {len(all_runs)} so far)...", len(all_runs))
+            
+            params = {
+                'limit': page_limit,
+                'offset': offset,
+                'order_by': '-id',
+                'include_related': '["job","trigger","environment","repository"]',
+                'status': status_code,
+                'created_at__range': f'["{start_iso}","{end_iso}"]'  # SERVER-SIDE date filtering!
+            }
+            
+            # Add environment filter if provided
+            if environment_id:
+                params['environment_id'] = environment_id
+            
+            try:
+                response = requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                
+                data = response.json()
+                page_runs = data.get('data', [])
+                
+                if not page_runs:
+                    break  # No more runs in date range
+                
+                # Deduplicate and add runs
+                for run in page_runs:
+                    run_id = run.get('id')
+                    if run_id and run_id not in seen_run_ids:
+                        seen_run_ids.add(run_id)
+                        all_runs.append(run)
+                        
+                        # Stop if we've hit our limit
+                        if len(all_runs) >= limit:
+                            break
+                
+                # If we've hit our limit, stop
+                if len(all_runs) >= limit:
+                    if progress_callback:
+                        progress_callback(f"Collected {len(all_runs)} runs (limit reached)", len(all_runs))
+                    break
+                
+                # If we got fewer runs than requested, we've reached the end
+                if len(page_runs) < page_limit:
+                    break
+                
+                offset += len(page_runs)
+                
+            except requests.exceptions.HTTPError as e:
+                if progress_callback:
+                    progress_callback(f"Error fetching runs: {e}", len(all_runs))
+                break
+    
+    return all_runs
+
+
+def get_all_jobs_with_metadata(api_base: str, api_key: str, account_id: str, progress_callback=None):
+    """
+    Fetch ALL jobs including active and inactive/deleted ones.
+    
+    Args:
+        api_base: dbt Cloud API base URL
+        api_key: dbt Cloud API key
+        account_id: dbt Cloud account ID
+        progress_callback: Optional callback(message, count) for progress updates
+    
+    Returns:
+        Dictionary mapping job_id -> job metadata (name, is_active, etc.)
+    """
+    url = f'{api_base}/api/v2/accounts/{account_id}/jobs/'
+    headers = {'Authorization': f'Token {api_key}'}
+    
+    all_jobs = {}
+    offset = 0
+    limit = 100
+    page_num = 0
+    
+    while True:
+        page_num += 1
+        
+        if progress_callback:
+            progress_callback(f"Fetching job metadata (page {page_num}, {len(all_jobs)} jobs so far)...", len(all_jobs))
+        
+        params = {
+            'limit': limit,
+            'offset': offset,
+            'order_by': '-id'
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            page_jobs = data.get('data', [])
+            
+            if not page_jobs:
+                break
+            
+            for job in page_jobs:
+                job_id = job.get('id')
+                if job_id:
+                    all_jobs[job_id] = {
+                        'id': job_id,
+                        'name': job.get('name', 'Unknown'),
+                        'is_active': job.get('state', 1) == 1,  # state=1 is active, state=2 is deleted
+                        'environment_id': job.get('environment_id'),
+                        'triggers': job.get('triggers', {})
+                    }
+            
+            # If we got fewer jobs than limit, we've reached the end
+            if len(page_jobs) < limit:
+                break
+            
+            offset += len(page_jobs)
+            
+        except requests.exceptions.HTTPError as e:
+            if progress_callback:
+                progress_callback(f"Error fetching jobs: {e}", len(all_jobs))
+            break
+    
+    return all_jobs
+
+
 def get_job_runs(api_base: str, api_key: str, account_id: str, job_id: str, 
                  environment_id: str = None, limit: int = 20, status: List[int] = None):
     """
@@ -458,30 +627,30 @@ def main():
     # Create tabs for different pages
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "⚙️ Configuration",
-        "🎯 Environment Overview", 
+        "🗑️ Pre-SAO Waste Analysis",
+        "🔀 Job Overlap Analysis",
         "📋 Model Details", 
         "📈 Historical Trends",
-        "💰 Cost Analysis",
-        "🔀 Job Overlap Analysis"
+        "💰 Cost Analysis"
     ])
     
     with tab1:
         show_configuration_page()
     
     with tab2:
-        show_model_reuse_slo_analysis()
+        show_pre_sao_waste_analysis()
     
     with tab3:
-        show_freshness_analysis()
+        show_job_overlap_analysis()
     
     with tab4:
-        show_run_status_analysis()
+        show_freshness_analysis()
     
     with tab5:
-        show_cost_analysis()
+        show_run_status_analysis()
     
     with tab6:
-        show_job_overlap_analysis()
+        show_cost_analysis()
 
 
 def show_configuration_sidebar():
@@ -854,8 +1023,69 @@ def show_freshness_analysis():
             # Calculate summary statistics
             summary = calculate_summary_stats(results)
             
-            # Show summary first
-            st.header("📊 Summary Statistics")
+            # Identify main project and show its summary
+            df_temp = pd.DataFrame(results)
+            if 'package_name' not in df_temp.columns and 'unique_id' in df_temp.columns:
+                df_temp['package_name'] = df_temp['unique_id'].apply(lambda x: x.split('.')[1] if isinstance(x, str) and len(x.split('.')) > 1 else 'unknown')
+            
+            # Find main project (package with most items)
+            if 'package_name' in df_temp.columns:
+                package_counts = df_temp['package_name'].value_counts()
+                if len(package_counts) > 0:
+                    main_project = package_counts.index[0]
+                    main_df = df_temp[df_temp['package_name'] == main_project]
+                    
+                    # Calculate metrics for main project
+                    main_models = main_df[main_df['resource_type'] == 'model']
+                    main_sources = main_df[main_df['resource_type'] == 'source']
+                    
+                    # Use is_freshness_configured which checks warn_after, error_after, AND build_after
+                    main_models_with_freshness = len(main_models[main_models['is_freshness_configured'] == True])
+                    main_models_total = len(main_models)
+                    main_models_pct = (main_models_with_freshness / main_models_total * 100) if main_models_total > 0 else 0
+                    
+                    main_sources_with_freshness = len(main_sources[main_sources['is_freshness_configured'] == True])
+                    main_sources_total = len(main_sources)
+                    main_sources_pct = (main_sources_with_freshness / main_sources_total * 100) if main_sources_total > 0 else 0
+                    
+                    # Display main project summary
+                    st.header(f"📦 Main Project Summary: {main_project}")
+                    st.markdown("*These metrics focus on your main project (the package with the most models)*")
+                    
+                    col1, col2, col3, col4, col5, col6 = st.columns(6)
+                    
+                    with col1:
+                        st.metric("Total Items", len(main_df))
+                    
+                    with col2:
+                        st.metric("Models", main_models_total)
+                    
+                    with col3:
+                        st.metric(
+                            "Models w/ Freshness",
+                            f"{main_models_pct:.1f}%",
+                            delta=f"{main_models_with_freshness}/{main_models_total}"
+                        )
+                    
+                    with col4:
+                        st.metric("Sources", main_sources_total)
+                    
+                    with col5:
+                        st.metric(
+                            "Sources w/ Freshness",
+                            f"{main_sources_pct:.1f}%",
+                            delta=f"{main_sources_with_freshness}/{main_sources_total}"
+                        )
+                    
+                    with col6:
+                        main_total_with_freshness = len(main_df[main_df['is_freshness_configured'] == True])
+                        main_total_pct = (main_total_with_freshness / len(main_df) * 100) if len(main_df) > 0 else 0
+                        st.metric("Overall Coverage", f"{main_total_pct:.1f}%")
+                    
+                    st.divider()
+            
+            # Show overall summary
+            st.header("📊 Summary Statistics (Entire Project including packages)")
             
             col1, col2, col3, col4 = st.columns(4)
             
@@ -903,6 +1133,7 @@ def show_freshness_analysis():
                 )
             
             # Detailed results
+            st.divider()
             st.header("📋 Detailed Results")
             
             # Convert to DataFrame
@@ -911,6 +1142,67 @@ def show_freshness_analysis():
             # Extract package from unique_id if not already present
             if 'package_name' not in df.columns and 'unique_id' in df.columns:
                 df['package_name'] = df['unique_id'].apply(lambda x: x.split('.')[1] if isinstance(x, str) and len(x.split('.')) > 1 else 'unknown')
+            
+            # Model Distribution by Build After Configuration
+            st.divider()
+            st.subheader("📈 Model Distribution by Build After Configuration")
+            
+            # Filter models with freshness config
+            models_with_config = df[df['build_after_count'].notna()].copy()
+            
+            if len(models_with_config) > 0:
+                # Create a combined label for build_after
+                models_with_config['build_after_label'] = models_with_config.apply(
+                    lambda row: f"{int(row['build_after_count'])} {row['build_after_period']}(s)" 
+                    if pd.notna(row['build_after_count']) and pd.notna(row['build_after_period'])
+                    else 'Unknown',
+                    axis=1
+                )
+                
+                # Count by build_after configuration
+                config_counts = models_with_config['build_after_label'].value_counts().reset_index()
+                config_counts.columns = ['Build After Config', 'Count']
+                
+                # Create bar chart
+                fig = px.bar(
+                    config_counts,
+                    x='Build After Config',
+                    y='Count',
+                    title='Model Count by Build After Configuration',
+                    text='Count',
+                    color='Count',
+                    color_continuous_scale='Blues'
+                )
+                
+                fig.update_traces(textposition='outside')
+                fig.update_layout(
+                    xaxis_title="Build After Configuration",
+                    yaxis_title="Number of Models",
+                    showlegend=False,
+                    height=400
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Show breakdown table
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.dataframe(config_counts, width='stretch', hide_index=True)
+                
+                with col2:
+                    # Pie chart
+                    fig_pie = px.pie(
+                        config_counts,
+                        names='Build After Config',
+                        values='Count',
+                        title='Build After Configuration Distribution'
+                    )
+                    st.plotly_chart(fig_pie, width='stretch')
+            else:
+                st.info("No models have freshness build_after configuration")
+            
+            st.divider()
             
             # Add filters
             col1, col2, col3 = st.columns(3)
@@ -1058,10 +1350,110 @@ def show_freshness_analysis():
         st.exception(e)
 
 
+def process_single_run_lightweight(api_base: str, api_key: str, account_id: str, run_id: int, 
+                                    run_created: str, job_id: str = None, job_name: str = None, 
+                                    run_status: int = None):
+    """
+    Lightweight version: Only fetches run_results and minimal manifest data for waste analysis.
+    
+    Does NOT fetch freshness configs or process sources - much faster!
+    
+    Args:
+        api_base: dbt Cloud API base URL
+        api_key: dbt Cloud API key
+        account_id: dbt Cloud account ID
+        run_id: Run ID to process
+        run_created: Run created timestamp
+        job_id: Job definition ID (optional)
+        job_name: Job name (optional)
+        run_status: Run invocation status code (optional)
+    """
+    try:
+        headers = {'Authorization': f'Token {api_key}'}
+        
+        # Fetch run_results.json only
+        run_results_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/run_results.json'
+        response = requests.get(run_results_url, headers=headers)
+        response.raise_for_status()
+        run_results = response.json()
+        
+        # Fetch minimal manifest data (only nodes for materialization lookup)
+        manifest_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/manifest.json'
+        response = requests.get(manifest_url, headers=headers)
+        response.raise_for_status()
+        manifest = response.json()
+        
+        models = []
+        for result in run_results.get('results', []):
+            unique_id = result.get('unique_id')
+            
+            # Only process models (not sources, tests, etc.)
+            if not unique_id or not unique_id.startswith('model.'):
+                continue
+            
+            # Get node info
+            node = manifest.get('nodes', {}).get(unique_id, {})
+            resource_type = node.get('resource_type')
+            
+            if resource_type != 'model':
+                continue
+            
+            # Get status and execution details
+            status = result.get('status')
+            execution_time = result.get('execution_time', 0)
+            
+            # Get timing
+            timing = result.get('timing', [])
+            started_at = None
+            completed_at = None
+            for t in timing:
+                if t.get('name') == 'execute':
+                    started_at = t.get('started_at')
+                    completed_at = t.get('completed_at')
+                    break
+            
+            # Get rows affected and materialization
+            adapter_response = result.get('adapter_response', {})
+            rows_affected = adapter_response.get('rows_affected')
+            materialization = node.get('config', {}).get('materialized')
+            
+            model_data = {
+                'unique_id': unique_id,
+                'name': unique_id.split('.')[-1] if unique_id else 'unknown',
+                'resource_type': resource_type,
+                'status': status,
+                'execution_time': execution_time,
+                'started_at': started_at,
+                'completed_at': completed_at,
+                'rows_affected': rows_affected,
+                'materialization': materialization,
+                'adapter_response': adapter_response,
+                'message': result.get('message'),
+                'run_id': run_id,
+                'run_created_at': run_created,
+                'job_id': job_id,
+                'job_name': job_name,
+                'run_status': run_status
+            }
+            models.append(model_data)
+        
+        return {
+            'run_id': run_id,
+            'success': True,
+            'models': models,
+            'job_id': job_id,
+            'job_name': job_name,
+            'run_status': run_status
+        }
+        
+    except Exception as e:
+        return {'run_id': run_id, 'success': False, 'error': str(e)}
+
+
 def process_single_run(api_base: str, api_key: str, account_id: str, run_id: int, run_created: str, 
                        job_id: str = None, job_name: str = None, run_status: int = None):
     """
-    Process a single run to extract model status data.
+    Process a single run to extract model status data (includes freshness configs).
     
     This function is designed to be called in parallel for multiple runs.
     
@@ -1798,896 +2190,6 @@ def fetch_all_models_graphql(api_key: str, environment_id: int, page_size: int =
     return all_nodes
 
 
-def show_model_reuse_slo_analysis():
-    """Show Environment Overview tab using GraphQL API."""
-    st.header("🎯 Environment Overview")
-    st.markdown("**Your main dashboard** for environment health, performance, and SLO compliance using real-time dbt Cloud data")
-    
-    # Check if configured
-    if not st.session_state.config['configured']:
-        st.warning("⚠️ Please configure your settings in the Configuration tab first")
-        return
-    
-    config = st.session_state.config
-    
-    # Environment ID input
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        environment_id_input = st.text_input(
-            "Environment ID",
-            value=config.get('environment_id', ''),
-            help="dbt Cloud environment ID for GraphQL queries",
-            key="reuse_environment_id"
-        )
-    
-    with col2:
-        st.markdown("")  # Spacing
-        st.markdown("")  # Spacing
-        analyze_button = st.button("🔍 Analyze Environment", type="primary", key="reuse_analyze")
-    
-    if not analyze_button:
-        st.info("⬆️ Enter an Environment ID and click 'Analyze Environment' to begin")
-        st.markdown("""
-        ### What This Analysis Provides:
-        - 📊 **SLO Compliance Table**: View models with their freshness config and current execution status
-        - 📈 **Build After Distribution**: See how models are distributed by build_after configuration
-        - 🔄 **Status Distribution**: Breakdown of reused vs success vs error statuses
-        - 🎯 **Reuse Percentage**: Current total reuse rate for the environment
-        """)
-        return
-    
-    if not environment_id_input:
-        st.error("❌ Please provide an Environment ID")
-        return
-    
-    try:
-        environment_id = int(environment_id_input)
-    except ValueError:
-        st.error("❌ Environment ID must be a number")
-        return
-    
-    # Fetch data
-    try:
-        with st.spinner("🔄 Fetching models from GraphQL API..."):
-            all_nodes = fetch_all_models_graphql(config['api_key'], environment_id)
-        
-        if not all_nodes:
-            st.warning("No models found for this environment")
-            return
-        
-        st.success(f"✅ Fetched {len(all_nodes)} models from environment {environment_id}")
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(all_nodes)
-        
-        # Parse config JSON
-        import ast
-        df['config'] = df['config'].apply(lambda x: json.loads(ast.literal_eval(x)) if isinstance(x, str) else x)
-        
-        # Extract nested executionInfo fields
-        df['last_run_generated_at'] = df['executionInfo'].apply(lambda x: x.get('lastRunGeneratedAt') if x else None)
-        df['execute_completed_at'] = df['executionInfo'].apply(lambda x: x.get('executeCompletedAt') if x else None)
-        df['last_run_status'] = df['executionInfo'].apply(lambda x: x.get('lastRunStatus') if x else None)
-        df['last_job_id'] = df['executionInfo'].apply(lambda x: x.get('lastSuccessJobDefinitionId') if x else None)
-        df['last_run_id'] = df['executionInfo'].apply(lambda x: x.get('lastSuccessRunId') if x else None)
-        df['last_run_error'] = df['executionInfo'].apply(lambda x: x.get('lastRunError') if x else None)
-        
-        # Extract freshness config from config JSON
-        df['build_after_count'] = df['config'].apply(lambda x: x.get('freshness', {}).get('build_after', {}).get('count') if isinstance(x, dict) else None)
-        df['build_after_period'] = df['config'].apply(lambda x: x.get('freshness', {}).get('build_after', {}).get('period') if isinstance(x, dict) else None)
-        df['updates_on'] = df['config'].apply(lambda x: x.get('freshness', {}).get('build_after', {}).get('updates_on') if isinstance(x, dict) else None)
-        df['materialization'] = df['config'].apply(lambda x: x.get('materialized') if isinstance(x, dict) else None)
-        
-        # Convert timestamps and remove timezone info for calculations
-        df['last_run_generated_at'] = pd.to_datetime(df['last_run_generated_at'], errors='coerce', utc=True).dt.tz_localize(None)
-        df['execute_completed_at'] = pd.to_datetime(df['execute_completed_at'], errors='coerce', utc=True).dt.tz_localize(None)
-        
-        # Calculate hours since last execution
-        df['hours_since_last_execution'] = (datetime.now() - df['execute_completed_at']).dt.total_seconds() / 3600
-        
-        # Calculate expected hours between runs
-        df['expected_hours_between_runs'] = df.apply(
-            lambda row: (
-                row['build_after_count'] * 24 if row['build_after_period'] == 'day'
-                else row['build_after_count'] if row['build_after_period'] == 'hour'
-                else None
-            ),
-            axis=1
-        )
-        
-        # Determine if outside of SLO
-        df['is_outside_of_slo'] = (
-            (df['hours_since_last_execution'] > df['expected_hours_between_runs']) &
-            (df['expected_hours_between_runs'].notna())
-        )
-        
-        # Display key metrics
-        st.divider()
-        st.subheader("🎯 Key Metrics")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            total_models = len(df)
-            st.metric("Total Models", f"{total_models:,}")
-        
-        with col2:
-            # Calculate reuse rate (models with 'reused' status)
-            reused_count = len(df[df['last_run_status'] == 'reused'])
-            reuse_pct = (reused_count / total_models * 100) if total_models > 0 else 0
-            st.metric("Reuse Rate", f"{reuse_pct:.1f}%", delta=f"{reused_count:,} models")
-        
-        with col3:
-            # Models with freshness config
-            has_freshness = df['build_after_count'].notna().sum()
-            freshness_pct = (has_freshness / total_models * 100) if total_models > 0 else 0
-            st.metric("Has Freshness Config", f"{freshness_pct:.1f}%", delta=f"{has_freshness:,} models")
-        
-        with col4:
-            # Models outside SLO
-            outside_slo = df['is_outside_of_slo'].sum()
-            slo_pct = (outside_slo / total_models * 100) if total_models > 0 else 0
-            st.metric("Outside SLO", f"{slo_pct:.1f}%", delta=f"{outside_slo:,} models")
-        
-        # State-Aware Orchestration analysis
-        st.divider()
-        st.subheader("🔄 State-Aware Orchestration (SAO) Adoption")
-        
-        with st.spinner("🔄 Analyzing jobs for SAO features..."):
-            # Fetch all jobs for this environment
-            jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
-            headers = {'Authorization': f'Token {config["api_key"]}'}
-            params = {'limit': 100, 'environment_id': environment_id}
-            
-            try:
-                jobs_response = requests.get(jobs_url, headers=headers, params=params)
-                jobs_response.raise_for_status()
-                jobs = jobs_response.json().get('data', [])
-                
-                if jobs:
-                    # Count SAO-enabled jobs
-                    sao_jobs = [job for job in jobs if check_job_has_sao(job)]
-                    total_jobs = len(jobs)
-                    sao_count = len(sao_jobs)
-                    sao_pct = (sao_count / total_jobs * 100) if total_jobs > 0 else 0
-                    
-                    # Display metrics
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric("Total Jobs", f"{total_jobs:,}")
-                    
-                    with col2:
-                        st.metric("SAO-Enabled Jobs", f"{sao_count:,}", delta=f"{sao_pct:.1f}%")
-                    
-                    with col3:
-                        st.metric("Non-SAO Jobs", f"{total_jobs - sao_count:,}", delta=f"{100 - sao_pct:.1f}%")
-                    
-                    # Create visualization
-                    st.markdown("#### SAO Adoption Distribution")
-                    
-                    # Prepare data for chart
-                    chart_data = pd.DataFrame({
-                        'Category': ['SAO-Enabled', 'Non-SAO'],
-                        'Count': [sao_count, total_jobs - sao_count],
-                        'Percentage': [sao_pct, 100 - sao_pct]
-                    })
-                    
-                    # Create two columns for charts
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        # Pie chart
-                        fig_pie = px.pie(
-                            chart_data, 
-                            values='Count', 
-                            names='Category',
-                            title='SAO Adoption by Job Count',
-                            color='Category',
-                            color_discrete_map={'SAO-Enabled': '#10b981', 'Non-SAO': '#6b7280'},
-                            hole=0.4
-                        )
-                        fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-                        st.plotly_chart(fig_pie, use_container_width=True)
-                    
-                    with col2:
-                        # Bar chart
-                        fig_bar = px.bar(
-                            chart_data,
-                            x='Category',
-                            y='Count',
-                            title='SAO Adoption by Job Count',
-                            color='Category',
-                            color_discrete_map={'SAO-Enabled': '#10b981', 'Non-SAO': '#6b7280'},
-                            text='Count'
-                        )
-                        fig_bar.update_traces(textposition='outside')
-                        fig_bar.update_layout(showlegend=False, yaxis_title='Number of Jobs')
-                        st.plotly_chart(fig_bar, use_container_width=True)
-                    
-                    # Scheduled Jobs SAO Analysis
-                    st.markdown("---")
-                    st.markdown("#### SAO Adoption for Scheduled Jobs")
-                    
-                    scheduled_jobs = [job for job in jobs if determine_job_type(job.get('triggers', {})) == 'scheduled']
-                    
-                    if scheduled_jobs:
-                        scheduled_sao_jobs = [job for job in scheduled_jobs if check_job_has_sao(job)]
-                        total_scheduled = len(scheduled_jobs)
-                        scheduled_sao_count = len(scheduled_sao_jobs)
-                        scheduled_sao_pct = (scheduled_sao_count / total_scheduled * 100) if total_scheduled > 0 else 0
-                        
-                        col1, col2 = st.columns([1, 2])
-                        
-                        with col1:
-                            # Metrics for scheduled jobs
-                            st.metric("Total Scheduled Jobs", f"{total_scheduled:,}")
-                            st.metric("SAO-Enabled", f"{scheduled_sao_count:,}", delta=f"{scheduled_sao_pct:.1f}%")
-                            st.metric("Non-SAO", f"{total_scheduled - scheduled_sao_count:,}", delta=f"{100 - scheduled_sao_pct:.1f}%")
-                        
-                        with col2:
-                            # Pie chart for scheduled jobs
-                            scheduled_chart_data = pd.DataFrame({
-                                'Category': ['SAO-Enabled', 'Non-SAO'],
-                                'Count': [scheduled_sao_count, total_scheduled - scheduled_sao_count],
-                                'Percentage': [scheduled_sao_pct, 100 - scheduled_sao_pct]
-                            })
-                            
-                            fig_scheduled_pie = px.pie(
-                                scheduled_chart_data,
-                                values='Count',
-                                names='Category',
-                                title=f'SAO Adoption for Scheduled Jobs ({total_scheduled} total)',
-                                color='Category',
-                                color_discrete_map={'SAO-Enabled': '#10b981', 'Non-SAO': '#6b7280'},
-                                hole=0.4
-                            )
-                            fig_scheduled_pie.update_traces(textposition='inside', textinfo='percent+label+value')
-                            st.plotly_chart(fig_scheduled_pie, use_container_width=True)
-                        
-                        # Show recommendation if scheduled SAO adoption is low
-                        if scheduled_sao_pct < 50:
-                            st.warning(f"""
-                            ⚠️ **Low SAO Adoption in Scheduled Jobs**: Only **{scheduled_sao_pct:.1f}%** ({scheduled_sao_count}/{total_scheduled}) of your scheduled production jobs use SAO.
-                            
-                            Scheduled jobs typically benefit most from SAO since they run repeatedly on the same data.
-                            """)
-                    else:
-                        st.info("No scheduled jobs found in this environment")
-                    
-                    # ========== NEW FEATURE 1: Job Type Breakdown ==========
-                    st.markdown("---")
-                    st.markdown("#### SAO Adoption by Job Type")
-                    st.markdown("Compare SAO adoption across CI, Merge, Scheduled, and Other job types")
-                    
-                    # Categorize all jobs by type and SAO status
-                    job_type_breakdown = {
-                        'ci': {'sao': 0, 'non_sao': 0},
-                        'merge': {'sao': 0, 'non_sao': 0},
-                        'scheduled': {'sao': 0, 'non_sao': 0},
-                        'other': {'sao': 0, 'non_sao': 0}
-                    }
-                    
-                    for job in jobs:
-                        job_type = determine_job_type(job.get('triggers', {}))
-                        has_sao = check_job_has_sao(job)
-                        
-                        if has_sao:
-                            job_type_breakdown[job_type]['sao'] += 1
-                        else:
-                            job_type_breakdown[job_type]['non_sao'] += 1
-                    
-                    # Create DataFrame for visualization
-                    breakdown_data = []
-                    for job_type, counts in job_type_breakdown.items():
-                        total = counts['sao'] + counts['non_sao']
-                        if total > 0:  # Only include types that exist
-                            breakdown_data.append({
-                                'Job Type': job_type.upper(),
-                                'SAO-Enabled': counts['sao'],
-                                'Non-SAO': counts['non_sao'],
-                                'Total': total,
-                                'SAO %': (counts['sao'] / total * 100) if total > 0 else 0
-                            })
-                    
-                    if breakdown_data:
-                        breakdown_df = pd.DataFrame(breakdown_data)
-                        
-                        # Create grouped bar chart
-                        fig_breakdown = go.Figure()
-                        
-                        fig_breakdown.add_trace(go.Bar(
-                            name='SAO-Enabled',
-                            x=breakdown_df['Job Type'],
-                            y=breakdown_df['SAO-Enabled'],
-                            marker_color='#10b981',
-                            text=breakdown_df['SAO-Enabled'],
-                            textposition='auto',
-                        ))
-                        
-                        fig_breakdown.add_trace(go.Bar(
-                            name='Non-SAO',
-                            x=breakdown_df['Job Type'],
-                            y=breakdown_df['Non-SAO'],
-                            marker_color='#6b7280',
-                            text=breakdown_df['Non-SAO'],
-                            textposition='auto',
-                        ))
-                        
-                        fig_breakdown.update_layout(
-                            title='SAO Adoption by Job Type',
-                            xaxis_title='Job Type',
-                            yaxis_title='Number of Jobs',
-                            barmode='group',
-                            height=400,
-                            showlegend=True,
-                            legend=dict(
-                                orientation="h",
-                                yanchor="bottom",
-                                y=1.02,
-                                xanchor="right",
-                                x=1
-                            )
-                        )
-                        
-                        st.plotly_chart(fig_breakdown, use_container_width=True)
-                        
-                        # Show summary table with percentages
-                        col1, col2 = st.columns([2, 1])
-                        
-                        with col1:
-                            st.dataframe(
-                                breakdown_df.style.format({
-                                    'SAO %': '{:.1f}%'
-                                }),
-                                use_container_width=True,
-                                hide_index=True
-                            )
-                        
-                        with col2:
-                            # Highlight key insights
-                            ci_jobs = breakdown_df[breakdown_df['Job Type'] == 'CI']
-                            if not ci_jobs.empty and ci_jobs.iloc[0]['SAO %'] < 50:
-                                st.warning("⚠️ **CI Jobs**: Low SAO adoption. CI jobs benefit greatly from SAO!")
-                            
-                            merge_jobs = breakdown_df[breakdown_df['Job Type'] == 'MERGE']
-                            if not merge_jobs.empty and merge_jobs.iloc[0]['SAO %'] < 50:
-                                st.warning("⚠️ **Merge Jobs**: Consider enabling SAO for faster deploys")
-                    
-                    # ========== NEW FEATURE 2: Freshness Config Coverage ==========
-                    st.markdown("---")
-                    st.markdown("#### Freshness Configuration Coverage")
-                    st.markdown("SAO works best when models have freshness configs. Identify misconfigurations:")
-                    
-                    # Analyze freshness config for each job
-                    jobs_sao_no_freshness = []
-                    jobs_freshness_no_sao = []
-                    jobs_both = []
-                    jobs_neither = []
-                    
-                    with st.spinner("🔄 Analyzing job configurations..."):
-                        for job in jobs:
-                            job_id = job['id']
-                            job_name = job['name']
-                            job_type = determine_job_type(job.get('triggers', {}))
-                            has_sao = check_job_has_sao(job)
-                            
-                            # Check if job has any freshness-related settings
-                            # We'll check the execute_steps for freshness-related commands
-                            execute_steps = job.get('execute_steps', [])
-                            has_freshness = any('freshness' in str(step).lower() for step in execute_steps)
-                            
-                            # Also check settings for common freshness indicators
-                            settings = job.get('settings', {})
-                            if not has_freshness:
-                                # Check for dbt build command which respects freshness
-                                has_freshness = any('dbt build' in str(step) for step in execute_steps)
-                            
-                            job_info = {
-                                'Job ID': job_id,
-                                'Job Name': job_name,
-                                'Job Type': job_type.upper(),
-                            }
-                            
-                            if has_sao and has_freshness:
-                                jobs_both.append(job_info)
-                            elif has_sao and not has_freshness:
-                                jobs_sao_no_freshness.append(job_info)
-                            elif not has_sao and has_freshness:
-                                jobs_freshness_no_sao.append(job_info)
-                            else:
-                                jobs_neither.append(job_info)
-                    
-                    # Create summary metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("✅ Both SAO & Freshness", len(jobs_both), help="Optimal configuration")
-                    
-                    with col2:
-                        st.metric("⚠️ SAO without Freshness", len(jobs_sao_no_freshness), help="May not reuse effectively")
-                    
-                    with col3:
-                        st.metric("💡 Freshness without SAO", len(jobs_freshness_no_sao), help="Missing optimization")
-                    
-                    with col4:
-                        st.metric("❌ Neither", len(jobs_neither), help="Basic configuration")
-                    
-                    # Visual breakdown
-                    config_data = pd.DataFrame({
-                        'Configuration': [
-                            '✅ Both',
-                            '⚠️ SAO Only',
-                            '💡 Freshness Only',
-                            '❌ Neither'
-                        ],
-                        'Count': [
-                            len(jobs_both),
-                            len(jobs_sao_no_freshness),
-                            len(jobs_freshness_no_sao),
-                            len(jobs_neither)
-                        ],
-                        'Status': ['Optimal', 'Suboptimal', 'Opportunity', 'Basic']
-                    })
-                    
-                    fig_config = px.bar(
-                        config_data,
-                        x='Configuration',
-                        y='Count',
-                        title='Job Configuration Coverage',
-                        color='Status',
-                        color_discrete_map={
-                            'Optimal': '#10b981',
-                            'Suboptimal': '#f59e0b',
-                            'Opportunity': '#3b82f6',
-                            'Basic': '#6b7280'
-                        },
-                        text='Count'
-                    )
-                    fig_config.update_traces(textposition='outside')
-                    fig_config.update_layout(showlegend=True, yaxis_title='Number of Jobs', height=400)
-                    st.plotly_chart(fig_config, use_container_width=True)
-                    
-                    # Show problematic configurations in expanders
-                    if jobs_sao_no_freshness:
-                        with st.expander(f"⚠️ {len(jobs_sao_no_freshness)} Jobs with SAO but NO Freshness Config (May Not Reuse!)"):
-                            st.warning("These jobs have SAO enabled but may not use freshness checks. Without freshness configs, models may not reuse effectively.")
-                            st.dataframe(pd.DataFrame(jobs_sao_no_freshness), use_container_width=True, hide_index=True)
-                    
-                    if jobs_freshness_no_sao:
-                        with st.expander(f"💡 {len(jobs_freshness_no_sao)} Jobs with Freshness but NO SAO (Optimization Opportunity!)"):
-                            st.info("These jobs check freshness but don't have SAO enabled. Enable SAO to skip unchanged models and reduce costs.")
-                            st.dataframe(pd.DataFrame(jobs_freshness_no_sao), use_container_width=True, hide_index=True)
-                    
-                    # ========== NEW FEATURE 3: Top Opportunities ==========
-                    st.markdown("---")
-                    st.markdown("#### 🎯 Top Opportunities: Jobs That Should Enable SAO")
-                    st.markdown("Prioritize enabling SAO on these jobs for maximum impact:")
-                    
-                    # Fetch run data for non-SAO jobs to calculate potential impact
-                    non_sao_jobs = [job for job in jobs if not check_job_has_sao(job)]
-                    
-                    if non_sao_jobs:
-                        opportunities = []
-                        
-                        with st.spinner(f"🔄 Analyzing {len(non_sao_jobs)} non-SAO jobs for optimization potential..."):
-                            for job in non_sao_jobs[:20]:  # Limit to top 20 for performance
-                                job_id = job['id']
-                                job_name = job['name']
-                                job_type = determine_job_type(job.get('triggers', {}))
-                                
-                                try:
-                                    # Fetch recent runs for this job
-                                    runs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/runs/'
-                                    run_params = {
-                                        'job_definition_id': job_id,
-                                        'limit': 10,
-                                        'order_by': '-id',
-                                        'status': '10'  # Success only
-                                    }
-                                    
-                                    runs_response = requests.get(runs_url, headers=headers, params=run_params)
-                                    runs_response.raise_for_status()
-                                    runs = runs_response.json().get('data', [])
-                                    
-                                    if runs:
-                                        # Calculate metrics
-                                        run_count = len(runs)
-                                        avg_duration = sum(r.get('duration_humanized_seconds', 0) or 0 for r in runs) / run_count if run_count > 0 else 0
-                                        avg_duration_mins = avg_duration / 60
-                                        
-                                        # Calculate potential impact score
-                                        # Higher score = more frequent + longer running = bigger opportunity
-                                        impact_score = run_count * avg_duration_mins
-                                        
-                                        # Priority based on job type
-                                        priority = 'High' if job_type in ['ci', 'merge'] else 'Medium' if job_type == 'scheduled' else 'Low'
-                                        
-                                        opportunities.append({
-                                            'Job ID': job_id,
-                                            'Job Name': job_name,
-                                            'Job Type': job_type.upper(),
-                                            'Recent Runs': run_count,
-                                            'Avg Duration (min)': round(avg_duration_mins, 2),
-                                            'Impact Score': round(impact_score, 2),
-                                            'Priority': priority
-                                        })
-                                
-                                except Exception as e:
-                                    # Skip jobs that error
-                                    continue
-                        
-                        if opportunities:
-                            opp_df = pd.DataFrame(opportunities)
-                            # Sort by impact score (descending)
-                            opp_df = opp_df.sort_values('Impact Score', ascending=False)
-                            
-                            # Show top 10
-                            st.markdown("**Top 10 Jobs by Potential Impact:**")
-                            
-                            # Style the dataframe with colored text instead of highlighting
-                            def color_priority(row):
-                                if row['Priority'] == 'High':
-                                    return ['color: #dc2626; font-weight: bold'] * len(row)  # Red text
-                                elif row['Priority'] == 'Medium':
-                                    return ['color: #d97706; font-weight: bold'] * len(row)  # Orange text
-                                else:
-                                    return ['color: #6b7280'] * len(row)  # Gray text
-                            
-                            styled_df = opp_df.head(10).style.apply(color_priority, axis=1)
-                            st.dataframe(styled_df, use_container_width=True, hide_index=True)
-                            
-                            # Show calculation explanation
-                            st.info("""
-                            **Impact Score Calculation**: `Recent Runs × Avg Duration (minutes)`
-                            
-                            Higher scores indicate jobs that run frequently and take longer, making them prime candidates for SAO optimization.
-                            
-                            **Priority Levels:**
-                            - 🔴 **High**: CI and Merge jobs (run most frequently)
-                            - 🟡 **Medium**: Scheduled jobs (regular cadence)
-                            - ⚪ **Low**: Other job types
-                            """)
-                            
-                            # Estimated savings
-                            total_impact = opp_df['Impact Score'].sum()
-                            st.success(f"""
-                            **💰 Estimated Opportunity**: If SAO reduces run time by 30-50% on these jobs:
-                            - Potential time savings: **{total_impact * 0.4:.0f} minutes** across recent runs
-                            - Focus on high-impact jobs first for maximum ROI
-                            """)
-                        else:
-                            st.info("No run data available for non-SAO jobs to calculate opportunities")
-                    else:
-                        st.success("🎉 All jobs have SAO enabled! No optimization opportunities.")
-                    
-                    # Show list of all jobs with SAO status in expander
-                    if jobs:
-                        with st.expander(f"📋 View All {len(jobs)} Jobs (SAO Status)"):
-                            all_jobs_df = pd.DataFrame([
-                                {
-                                    'Job ID': job['id'],
-                                    'Job Name': job['name'],
-                                    'Job Type': determine_job_type(job.get('triggers', {})),
-                                    'SAO Enabled': '✅ Yes' if check_job_has_sao(job) else '❌ No',
-                                    'Environment ID': job.get('environment_id')
-                                }
-                                for job in jobs
-                            ])
-                            # Sort by SAO status (enabled first) then by job name
-                            all_jobs_df = all_jobs_df.sort_values(['SAO Enabled', 'Job Name'], ascending=[False, True])
-                            st.dataframe(all_jobs_df, use_container_width=True, hide_index=True)
-                    
-                    # Show recommendations if SAO adoption is low
-                    if sao_pct < 50:
-                        st.info(f"""
-                        💡 **Recommendation**: Consider enabling State-Aware Orchestration (SAO) on more jobs to improve efficiency.
-                        
-                        Current adoption: **{sao_pct:.1f}%** ({sao_count}/{total_jobs} jobs)
-                        
-                        SAO benefits:
-                        - Skips unchanged models, reducing compute costs
-                        - Faster run times by only building what's necessary
-                        - Better resource utilization across your environment
-                        """)
-                else:
-                    st.warning("No jobs found for this environment")
-                    
-            except requests.exceptions.RequestException as e:
-                st.error(f"❌ Error fetching jobs: {str(e)}")
-        
-        # TODO 1: SLO Compliance Table
-        st.divider()
-        st.subheader("📊 SLO Compliance Table")
-        
-        # Create display table
-        display_df = df[[
-            'name', 'packageName', 'resourceType', 'last_run_generated_at',
-            'execute_completed_at', 'hours_since_last_execution', 'last_run_status',
-            'last_job_id', 'last_run_id', 'build_after_count', 'build_after_period',
-            'updates_on', 'materialization', 'expected_hours_between_runs', 'is_outside_of_slo'
-        ]].copy()
-        
-        # Round numeric columns
-        display_df['hours_since_last_execution'] = display_df['hours_since_last_execution'].round(2)
-        display_df['expected_hours_between_runs'] = display_df['expected_hours_between_runs'].round(2)
-        
-        # Rename columns for display
-        display_df.columns = [
-            'Name', 'Package', 'Type', 'Last Run Generated',
-            'Last Execution', 'Hours Since Exec', 'Status',
-            'Job ID', 'Run ID', 'Build Count', 'Build Period',
-            'Updates On', 'Materialization', 'Expected Hours', 'Outside SLO'
-        ]
-        
-        # Filter options
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            status_filter = st.multiselect(
-                "Filter by Status",
-                options=sorted(df['last_run_status'].dropna().unique()),
-                default=None,
-                key="reuse_status_filter"
-            )
-        
-        with col2:
-            slo_filter = st.selectbox(
-                "SLO Status",
-                options=["All", "Within SLO", "Outside SLO"],
-                key="reuse_slo_filter"
-            )
-        
-        with col3:
-            has_freshness_filter = st.selectbox(
-                "Freshness Config",
-                options=["All", "Has Config", "No Config"],
-                key="reuse_freshness_filter"
-            )
-        
-        # Apply filters
-        filtered_display = display_df.copy()
-        
-        if status_filter:
-            filtered_display = filtered_display[filtered_display['Status'].isin(status_filter)]
-        
-        if slo_filter == "Within SLO":
-            filtered_display = filtered_display[filtered_display['Outside SLO'] == False]
-        elif slo_filter == "Outside SLO":
-            filtered_display = filtered_display[filtered_display['Outside SLO'] == True]
-        
-        if has_freshness_filter == "Has Config":
-            filtered_display = filtered_display[filtered_display['Build Count'].notna()]
-        elif has_freshness_filter == "No Config":
-            filtered_display = filtered_display[filtered_display['Build Count'].isna()]
-        
-        # Style the dataframe
-        st.dataframe(
-            filtered_display,
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "Outside SLO": st.column_config.CheckboxColumn("Outside SLO")
-            }
-        )
-        
-        st.caption(f"Showing {len(filtered_display):,} of {len(display_df):,} models")
-        
-        # TODO 2: Model Distribution by Build After Configuration
-        st.divider()
-        st.subheader("📈 Model Distribution by Build After Configuration")
-        
-        # Filter models with freshness config
-        models_with_config = df[df['build_after_count'].notna()].copy()
-        
-        if len(models_with_config) > 0:
-            # Create a combined label for build_after
-            models_with_config['build_after_label'] = models_with_config.apply(
-                lambda row: f"{int(row['build_after_count'])} {row['build_after_period']}(s)" 
-                if pd.notna(row['build_after_count']) and pd.notna(row['build_after_period'])
-                else 'Unknown',
-                axis=1
-            )
-            
-            # Count by build_after configuration
-            config_counts = models_with_config['build_after_label'].value_counts().reset_index()
-            config_counts.columns = ['Build After Config', 'Count']
-            
-            # Create bar chart
-            fig = px.bar(
-                config_counts,
-                x='Build After Config',
-                y='Count',
-                title='Model Count by Build After Configuration',
-                text='Count',
-                color='Count',
-                color_continuous_scale='Blues'
-            )
-            
-            fig.update_traces(textposition='outside')
-            fig.update_layout(
-                xaxis_title="Build After Configuration",
-                yaxis_title="Number of Models",
-                showlegend=False,
-                height=400
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Show breakdown table
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.dataframe(config_counts, width='stretch', hide_index=True)
-            
-            with col2:
-                # Pie chart
-                fig_pie = px.pie(
-                    config_counts,
-                    names='Build After Config',
-                    values='Count',
-                    title='Build After Configuration Distribution'
-                )
-                st.plotly_chart(fig_pie, width='stretch')
-        else:
-            st.info("No models have freshness build_after configuration")
-        
-        # TODO 3: Distribution of Statuses
-        st.divider()
-        st.subheader("🔄 Distribution of Statuses (Reused vs Success vs Error)")
-        
-        # Count by status
-        status_counts = df['last_run_status'].value_counts().reset_index()
-        status_counts.columns = ['Status', 'Count']
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Bar chart
-            fig_status_bar = px.bar(
-                status_counts,
-                x='Status',
-                y='Count',
-                title='Model Count by Execution Status',
-                text='Count',
-                color='Status',
-                color_discrete_map={
-                    'success': '#28a745',
-                    'reused': '#17a2b8',
-                    'error': '#dc3545',
-                    'skipped': '#ffc107'
-                }
-            )
-            
-            fig_status_bar.update_traces(textposition='outside')
-            fig_status_bar.update_layout(
-                xaxis_title="Status",
-                yaxis_title="Number of Models",
-                showlegend=False,
-                height=400
-            )
-            
-            st.plotly_chart(fig_status_bar, width='stretch')
-        
-        with col2:
-            # Pie chart
-            fig_status_pie = px.pie(
-                status_counts,
-                names='Status',
-                values='Count',
-                title='Status Distribution',
-                color='Status',
-                color_discrete_map={
-                    'success': '#28a745',
-                    'reused': '#17a2b8',
-                    'error': '#dc3545',
-                    'skipped': '#ffc107'
-                }
-            )
-            st.plotly_chart(fig_status_pie, width='stretch')
-        
-        # Status breakdown table
-        status_counts['Percentage'] = (status_counts['Count'] / status_counts['Count'].sum() * 100).round(1)
-        status_counts['Percentage'] = status_counts['Percentage'].astype(str) + '%'
-        
-        st.dataframe(status_counts, width='stretch', hide_index=True)
-        
-        # TODO 4: Output Current Total Reuse Percentage
-        st.divider()
-        st.subheader("🎯 Current Total Reuse Percentage")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            reused_models = len(df[df['last_run_status'] == 'reused'])
-            total = len(df)
-            reuse_rate = (reused_models / total * 100) if total > 0 else 0
-            
-            st.metric(
-                "Total Reuse Rate",
-                f"{reuse_rate:.2f}%",
-                delta=f"{reused_models:,} of {total:,} models"
-            )
-            
-            # Progress bar
-            st.progress(min(reuse_rate / 100, 1.0))
-            
-            if reuse_rate >= 30:
-                st.success(f"✅ **Exceeds target of 30%** ({reuse_rate - 30:.1f}% above)")
-            elif reuse_rate >= 20:
-                st.info(f"ℹ️ **Good performance** (target is 30%)")
-            else:
-                st.warning(f"⚠️ **Below typical range** (target is 30%)")
-        
-        with col2:
-            success_models = len(df[df['last_run_status'] == 'success'])
-            success_rate = (success_models / total * 100) if total > 0 else 0
-            
-            st.metric(
-                "Success Rate",
-                f"{success_rate:.2f}%",
-                delta=f"{success_models:,} models"
-            )
-        
-        with col3:
-            error_models = len(df[df['last_run_status'] == 'error'])
-            error_rate = (error_models / total * 100) if total > 0 else 0
-            
-            st.metric(
-                "Error Rate",
-                f"{error_rate:.2f}%",
-                delta=f"{error_models:,} models",
-                delta_color="inverse"
-            )
-        
-        # Insights
-        st.divider()
-        st.subheader("💡 Insights & Recommendations")
-        
-        insights = []
-        
-        if reuse_rate < 20:
-            insights.append("🔸 **Low reuse rate**: Consider enabling incremental builds with freshness checks to improve cache utilization")
-        
-        if freshness_pct < 50:
-            insights.append(f"🔸 **Low freshness coverage ({freshness_pct:.1f}%)**: Add freshness configuration to more models to enable reuse")
-        
-        if outside_slo > 0:
-            insights.append(f"🔸 **{outside_slo} models outside SLO**: Review and update models that haven't run within their expected timeframe")
-        
-        if error_rate > 5:
-            insights.append(f"🔸 **High error rate ({error_rate:.1f}%)**: Investigate and fix failing models")
-        
-        if reuse_rate >= 30 and error_rate < 5:
-            insights.append("✅ **Excellent performance**: Your environment is well-configured with good reuse rates and low errors")
-        
-        if insights:
-            for insight in insights:
-                st.markdown(insight)
-        else:
-            st.success("✅ No major issues detected")
-        
-        # Download option
-        st.divider()
-        st.subheader("💾 Download Data")
-        
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Full Analysis as CSV",
-            data=csv,
-            file_name=f"model_reuse_slo_analysis_env_{environment_id}.csv",
-            mime="text/csv"
-        )
-        
-    except requests.exceptions.HTTPError as e:
-        st.error(f"❌ API Error: {e}")
-        st.error("Please check your API key and environment ID")
-    except Exception as e:
-        st.error(f"❌ Error: {str(e)}")
-        st.exception(e)
-
-
 def show_cost_analysis():
     """Show cost analysis and ROI tracking."""
     st.header("💰 Cost Analysis & ROI")
@@ -3332,6 +2834,797 @@ def show_cost_analysis():
         st.exception(e)
 
 
+def show_pre_sao_waste_analysis():
+    """Show Pre-SAO Waste Analysis - identify wasted compute before SAO implementation."""
+    st.header("🗑️ Pre-SAO Waste Analysis")
+    st.markdown("Identify wasted compute spend from models that ran but produced minimal or no changes")
+    
+    # Check if configured
+    if not st.session_state.config['configured']:
+        st.warning("⚠️ Please configure your settings in the Configuration tab first")
+        return
+    
+    config = st.session_state.config
+    
+    # Info expander
+    with st.expander("💡 What is Pre-SAO Waste?", expanded=False):
+        st.markdown("""
+        ### The Problem
+        Before State-Aware Orchestration (SAO), models run even when:
+        - **No upstream data changed** (incremental models with 0 new rows)
+        - **No changes in the result** (table models rebuilding identical data)
+        - **Views** (these don't cost anything but show execution in logs)
+        
+        ### What We Analyze
+        This analysis identifies:
+        1. **View models**: Excluded from cost calculations (they don't drive warehouse costs)
+        2. **Zero-change table models**: Full table refreshes with 0 rows changed
+        3. **Zero/low-change incrementals**: Incremental models with 0 or very few new rows
+        
+        ### How We Detect This
+        We parse `run_results.json` from each run to extract:
+        - `adapter_response.rows_affected`: Number of rows changed/inserted
+        - `materialization`: Model type (view, table, incremental, etc.)
+        - `execution_time`: Time spent on execution
+        
+        ### Example
+        ```
+        Model: fct_orders (incremental)
+        - Run 1: 53 rows inserted → Useful work
+        - Run 2: 0 rows inserted → WASTE (should have been skipped)
+        - Run 3: 2 rows inserted → Minimal change (could argue for skip)
+        ```
+        
+        ### Impact with SAO
+        With SAO enabled, these models would be automatically skipped, saving compute costs!
+        
+        ### How This Analysis Works
+        1. **Fetches runs by date range**: Gets ALL successful runs in your specified date range
+        2. **Includes historical jobs**: Captures data from jobs that no longer exist (deleted/archived)
+        3. **Enriches with job metadata**: Shows job names and whether they're still active
+        4. **Analyzes row changes**: Uses `adapter_response.rows_affected` for accurate waste detection
+        
+        ### Important Notes
+        - **Historical data included**: This analysis captures runs from deleted/archived jobs
+        - **Status Filter**: Only successful runs are analyzed (failed runs don't produce meaningful waste metrics)
+        - **Job metadata**: Shows which jobs are still active vs. historical/deleted
+        """)
+    
+    st.divider()
+    
+    # Configuration section
+    st.subheader("⚙️ Analysis Configuration")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        warehouse_size = st.selectbox(
+            "Warehouse Size",
+            options=["X-Small", "Small", "Medium", "Large", "X-Large", "2X-Large", "3X-Large", "4X-Large"],
+            index=2,
+            help="Select your typical warehouse size",
+            key="waste_warehouse"
+        )
+    
+    with col2:
+        default_costs = {
+            "X-Small": 1.0,
+            "Small": 2.0,
+            "Medium": 4.0,
+            "Large": 8.0,
+            "X-Large": 16.0,
+            "2X-Large": 32.0,
+            "3X-Large": 64.0,
+            "4X-Large": 128.0
+        }
+        
+        cost_per_hour = st.number_input(
+            "Cost per Hour ($)",
+            min_value=0.0,
+            value=float(default_costs[warehouse_size]),
+            step=0.1,
+            help="Cost per compute hour for your warehouse",
+            key="waste_cost"
+        )
+    
+    with col3:
+        min_rows_threshold = st.number_input(
+            "Min Rows Threshold",
+            min_value=0,
+            value=10,
+            step=1,
+            help="Incremental models with fewer rows than this are considered 'low change'",
+            key="waste_threshold"
+        )
+    
+    # Job selection
+    st.subheader("📋 Analysis Scope")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        job_source = st.selectbox(
+            "Job Source",
+            options=["All Jobs in Environment", "Specific Job ID"],
+            help="Analyze all jobs or filter to one",
+            key="waste_job_source"
+        )
+    
+    with col2:
+        if job_source == "Specific Job ID":
+            job_id_input = st.text_input("Job ID", help="Specific dbt Cloud job ID", key="waste_job_id")
+        else:
+            job_id_input = None
+            job_types_filter = st.multiselect(
+                "Job Types",
+                options=["ci", "merge", "scheduled", "other"],
+                default=["ci", "merge", "scheduled", "other"],
+                help="Filter by job type",
+                key="waste_job_types"
+            )
+    
+    # Date range
+    st.subheader("📅 Analysis Period")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        default_start = datetime.now() - timedelta(days=30)
+        start_date = st.date_input(
+            "Start Date",
+            value=default_start,
+            help="Start of analysis period",
+            key="waste_start_date"
+        )
+    
+    with col2:
+        end_date = st.date_input(
+            "End Date",
+            value=datetime.now(),
+            help="End of analysis period",
+            key="waste_end_date"
+        )
+    
+    with col3:
+        max_runs = st.slider(
+            "Max Runs per Job",
+            min_value=10,
+            max_value=200,
+            value=100,
+            step=10,
+            help="Maximum runs to fetch per job (higher = more data but slower)",
+            key="waste_max_runs"
+        )
+    
+    analyze_button = st.button("🔍 Analyze Waste", type="primary", key="waste_analyze")
+    
+    if not analyze_button:
+        st.info("⬆️ Configure parameters and click 'Analyze Waste' to begin")
+        
+        with st.expander("📊 What You'll See"):
+            st.markdown("""
+            ### Key Metrics
+            - **Total Wasted Cost**: Money spent on zero/low-change model runs
+            - **Wasted Runs**: Count of model executions that produced no meaningful changes
+            - **Potential SAO Savings**: Estimated savings if SAO was enabled
+            
+            ### Visualizations
+            - Waste over time (cost and count)
+            - Top wasters (which models waste most)
+            - Waste by materialization type
+            - Detailed model-level breakdown
+            
+            ### Actionable Insights
+            - Which models should have SAO enabled first
+            - Which jobs have the most waste
+            - ROI estimate for SAO implementation
+            """)
+        return
+    
+    # Validation
+    if job_source == "Specific Job ID" and not job_id_input:
+        st.error("❌ Please provide a Job ID when using 'Specific Job ID' mode")
+        return
+    elif job_source == "All Jobs in Environment" and not config.get('environment_id'):
+        st.error("❌ Please configure Environment ID in the Configuration tab to use 'All Jobs in Environment' mode")
+        return
+    
+    try:
+        # Convert dates to datetime
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        end_datetime = datetime.combine(end_date, datetime.max.time())
+        
+        # Progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # NEW APPROACH: Fetch runs by date first, then enrich with job metadata
+        progress_bar.progress(5)
+        
+        def update_progress(msg, count):
+            """Helper to update progress during API calls"""
+            status_text.text(f"🔄 {msg}")
+        
+        if job_source == "All Jobs in Environment":
+            # Fetch ALL runs in the date range (includes historical/deleted jobs)
+            update_progress(f"Fetching all runs from {start_date} to {end_date}...", 0)
+            
+            runs = get_all_runs_by_date(
+                config['api_base'],
+                config['api_key'],
+                config['account_id'],
+                start_datetime,
+                end_datetime,
+                environment_id=config.get('environment_id'),
+                status=[10],  # Success only for waste analysis
+                limit=max_runs,  # Use slider value directly - all runs have waste data
+                progress_callback=update_progress
+            )
+            
+            status_text.text(f"✅ Found {len(runs)} successful runs in date range")
+            progress_bar.progress(10)
+            
+            # Get all jobs (including inactive/deleted ones)
+            all_jobs_dict = get_all_jobs_with_metadata(
+                config['api_base'],
+                config['api_key'],
+                config['account_id'],
+                progress_callback=update_progress
+            )
+            
+            status_text.text(f"✅ Found {len(all_jobs_dict)} total jobs (active + inactive)")
+            progress_bar.progress(15)
+            
+            # Enrich runs with job metadata
+            for run in runs:
+                job_def_id = run.get('job_definition_id')
+                if job_def_id and job_def_id in all_jobs_dict:
+                    job_info = all_jobs_dict[job_def_id]
+                    run['job_name'] = job_info['name']
+                    run['job_is_active'] = job_info['is_active']
+                    run['job_triggers'] = job_info['triggers']
+                else:
+                    # Job not found (might be deleted and not in API response)
+                    run['job_name'] = f'Job {job_def_id} (Deleted)'
+                    run['job_is_active'] = False
+                    run['job_triggers'] = {}
+            
+            # Filter by job type if specified
+            if job_types_filter:
+                filtered_runs = []
+                for run in runs:
+                    job_type = determine_job_type(run.get('job_triggers', {}))
+                    if job_type in job_types_filter:
+                        filtered_runs.append(run)
+                
+                status_text.text(f"✅ Filtered to {len(filtered_runs)} runs matching job types: {', '.join(job_types_filter)}")
+                runs = filtered_runs
+        else:
+            # Specific job ID mode
+            runs = get_job_runs(
+                config['api_base'],
+                config['api_key'],
+                config['account_id'],
+                job_id_input,
+                config.get('environment_id'),
+                limit=max_runs,
+                status=[10]
+            )
+            
+            # Filter by date
+            filtered_runs = []
+            for run in runs:
+                created_at_str = run.get('created_at')
+                if created_at_str:
+                    try:
+                        created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                        created_at = created_at.replace(tzinfo=None)
+                        
+                        if created_at < start_datetime or created_at > end_datetime:
+                            continue
+                        
+                        filtered_runs.append(run)
+                    except:
+                        pass
+            runs = filtered_runs
+            
+            # Enrich with job metadata
+            all_jobs_dict = get_all_jobs_with_metadata(
+                config['api_base'],
+                config['api_key'],
+                config['account_id']
+            )
+            
+            for run in runs:
+                job_def_id = run.get('job_definition_id')
+                if job_def_id and job_def_id in all_jobs_dict:
+                    job_info = all_jobs_dict[job_def_id]
+                    run['job_name'] = job_info['name']
+                    run['job_is_active'] = job_info['is_active']
+                else:
+                    run['job_name'] = f'Job {job_def_id}'
+                    run['job_is_active'] = False
+        
+        if not runs:
+            progress_bar.empty()
+            status_text.empty()
+            
+            st.warning(f"⚠️ No successful runs found in the specified date range ({start_date} to {end_date})")
+            
+            with st.expander("🔍 Diagnostic Information", expanded=True):
+                if job_source == "All Jobs in Environment":
+                    active_count = len([j for j in all_jobs_dict.values() if j['is_active']])
+                    inactive_count = len(all_jobs_dict) - active_count
+                    
+                    st.markdown(f"""
+                    **What was analyzed:**
+                    - Environment ID: {config.get('environment_id')}
+                    - Total jobs (active + inactive): {len(all_jobs_dict)} ({active_count} active, {inactive_count} inactive)
+                    - Job types filter: {', '.join(job_types_filter) if job_types_filter else 'All types'}
+                    - Date range: {start_date} to {end_date}
+                    - Successful runs found: {len(runs)}
+                    
+                    **Possible reasons:**
+                    1. **No successful runs in this date range** - Try expanding the date range
+                    2. **Job type filter too restrictive** - Try selecting all job types
+                    3. **Environment had no activity** - Verify the environment was active during this period
+                    
+                    **Suggestions:**
+                    - ✅ Try selecting all job types (CI, Merge, Scheduled, Other)
+                    - ✅ Expand the date range (currently analyzing last {(end_date - start_date).days} days)
+                    - ✅ Try a different environment ID if you have multiple
+                    - ✅ Use "Specific Job ID" mode if you know a job that was running
+                    """)
+                else:
+                    st.markdown(f"""
+                    **What was analyzed:**
+                    - Job ID: {job_id_input}
+                    - Date range: {start_date} to {end_date}
+                    - Successful runs found: {len(runs)}
+                    
+                    **Possible reasons:**
+                    1. **No successful runs in this date range** - Try expanding the date range
+                    2. **Job didn't run during this period** - Verify the job was active
+                    3. **Status filter** - Only successful runs (status=10) are analyzed
+                    
+                    **Suggestions:**
+                    - ✅ Expand the date range
+                    - ✅ Verify the job ID is correct
+                    - ✅ Check if the job was active during this period
+                    """)
+            
+            return
+        
+        status_text.text(f"✅ Found {len(runs)} runs. Analyzing for waste...")
+        progress_bar.progress(10)
+        
+        # Analyze runs in parallel
+        all_model_data = []
+        completed_runs = 0
+        failed_runs = []
+        max_workers = min(10, len(runs))
+        
+        # Store run metadata for later enrichment
+        run_metadata = {}
+        for run in runs:
+            run_metadata[run.get('id')] = {
+                'job_name': run.get('job_name', 'Unknown'),
+                'job_is_active': run.get('job_is_active', True)
+            }
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_run = {
+                executor.submit(
+                    process_single_run_lightweight,  # Use lightweight version - no freshness configs needed!
+                    config['api_base'],
+                    config['api_key'],
+                    config['account_id'],
+                    run.get('id'),
+                    run.get('created_at'),
+                    run.get('job_definition_id'),
+                    run.get('job_name', run.get('job', {}).get('name') if run.get('job') else None),
+                    run.get('status')
+                ): run.get('id') for run in runs
+            }
+            
+            for future in as_completed(future_to_run):
+                run_id = future_to_run[future]
+                completed_runs += 1
+                
+                progress = 10 + int((completed_runs / len(runs)) * 80)
+                progress_bar.progress(progress)
+                status_text.text(f"🔄 Processed {completed_runs}/{len(runs)} runs...")
+                
+                try:
+                    result = future.result()
+                    if result['success']:
+                        all_model_data.extend(result['models'])
+                    else:
+                        failed_runs.append((run_id, result.get('error', 'Unknown error')))
+                except Exception as e:
+                    failed_runs.append((run_id, str(e)))
+        
+        progress_bar.progress(100)
+        status_text.text("✅ Analysis complete!")
+        
+        # Show warnings
+        if failed_runs:
+            with st.expander(f"⚠️ {len(failed_runs)} run(s) failed to process", expanded=False):
+                for run_id, error in failed_runs:
+                    st.caption(f"Run {run_id}: {error}")
+        
+        # Convert to dataframe
+        if all_model_data:
+            df = pd.DataFrame(all_model_data)
+        else:
+            df = pd.DataFrame()
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        if df.empty:
+            st.warning("No model execution data found")
+            return
+        
+        # Process the data for waste analysis
+        st.success(f"✅ Analyzed {len(df):,} model executions across {df['run_id'].nunique()} runs")
+        
+        # Show job statistics if we analyzed multiple jobs
+        if job_source == "All Jobs in Environment" and all_jobs_dict:
+            with st.expander("📊 Job Statistics", expanded=False):
+                unique_job_ids = df['job_id'].unique()
+                jobs_with_data = len(unique_job_ids)
+                active_jobs_with_data = sum(1 for jid in unique_job_ids if all_jobs_dict.get(jid, {}).get('is_active', False))
+                inactive_jobs_with_data = jobs_with_data - active_jobs_with_data
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Jobs Analyzed", jobs_with_data)
+                with col2:
+                    st.metric("Active Jobs", active_jobs_with_data, delta="Currently running")
+                with col3:
+                    st.metric("Inactive/Deleted Jobs", inactive_jobs_with_data, delta="Historical data")
+                
+                if inactive_jobs_with_data > 0:
+                    st.info(f"💡 **Historical data included**: {inactive_jobs_with_data} job(s) no longer exist but had runs in this period")
+                    
+                    # Show which jobs are inactive
+                    inactive_jobs = []
+                    for jid in unique_job_ids:
+                        job_info = all_jobs_dict.get(jid)
+                        if job_info and not job_info.get('is_active', True):
+                            run_count = len(df[df['job_id'] == jid])
+                            inactive_jobs.append({
+                                'Job ID': jid,
+                                'Job Name': job_info['name'],
+                                'Runs in Period': run_count
+                            })
+                    
+                    if inactive_jobs:
+                        st.markdown("**Inactive/Deleted Jobs:**")
+                        inactive_df = pd.DataFrame(inactive_jobs)
+                        st.dataframe(inactive_df, use_container_width=True, hide_index=True)
+        
+        # Convert run_created_at to datetime
+        df['run_created_at'] = pd.to_datetime(df['run_created_at'])
+        
+        # Calculate execution cost
+        df['execution_time_hours'] = df['execution_time'] / 3600
+        df['cost'] = df['execution_time_hours'] * cost_per_hour
+        
+        # Categorize waste
+        df['waste_category'] = 'Not Waste'
+        df['is_waste'] = False
+        
+        # 1. Exclude views (they don't cost anything)
+        view_mask = df['materialization'] == 'view'
+        df.loc[view_mask, 'waste_category'] = 'View (Excluded)'
+        
+        # 2. For non-views that executed (status = success)
+        executed_mask = (df['status'] == 'success') & (~view_mask)
+        
+        # 3. Clean rows_affected for analysis
+        df['rows_affected_clean'] = df['rows_affected'].fillna(0).astype(float)
+        
+        # 4. Analyze patterns PER MODEL to categorize waste intelligently
+        for unique_id in df[executed_mask]['unique_id'].unique():
+            model_runs = df[(df['unique_id'] == unique_id) & executed_mask]
+            
+            if len(model_runs) == 0:
+                continue
+            
+            # Count zero and non-zero runs
+            zero_runs = (model_runs['rows_affected_clean'] == 0).sum()
+            total_runs = len(model_runs)
+            zero_pct = zero_runs / total_runs if total_runs > 0 else 0
+            
+            # Get materialization
+            materialization = model_runs['materialization'].iloc[0] if len(model_runs) > 0 else None
+            
+            # Pattern Detection:
+            if zero_runs == total_runs and total_runs >= 2:
+                # ALWAYS ZERO: All runs have 0 changes (likely deprecated/unused table)
+                df.loc[(df['unique_id'] == unique_id) & executed_mask, 'waste_category'] = 'Always Zero (Deprecated?)'
+                df.loc[(df['unique_id'] == unique_id) & executed_mask, 'is_waste'] = True
+                
+            elif zero_pct >= 0.3 and zero_runs >= 2:
+                # SPORADIC ZEROS: ≥30% of runs are zero (e.g., weekends, periodic patterns)
+                zero_mask = (df['unique_id'] == unique_id) & executed_mask & (df['rows_affected_clean'] == 0)
+                df.loc[zero_mask, 'waste_category'] = 'Sporadic Zeros (Periodic Pattern?)'
+                df.loc[zero_mask, 'is_waste'] = True
+                
+            elif zero_runs > 0:
+                # OCCASIONAL ZEROS: Some zero runs but not a pattern
+                zero_mask = (df['unique_id'] == unique_id) & executed_mask & (df['rows_affected_clean'] == 0)
+                df.loc[zero_mask, 'waste_category'] = 'Occasional Zero Changes'
+                df.loc[zero_mask, 'is_waste'] = True
+                
+            # Check for low-change incrementals (even if they never hit zero)
+            if materialization == 'incremental':
+                low_change_mask = (df['unique_id'] == unique_id) & executed_mask & \
+                                  (df['rows_affected_clean'] > 0) & \
+                                  (df['rows_affected_clean'] <= min_rows_threshold)
+                
+                if low_change_mask.sum() > 0:
+                    df.loc[low_change_mask, 'waste_category'] = f'Low Changes (<={min_rows_threshold} rows)'
+                    df.loc[low_change_mask, 'is_waste'] = True
+        
+        # Calculate waste metrics
+        waste_df = df[df['is_waste'] == True].copy()
+        
+        if waste_df.empty:
+            st.info("🎉 No waste detected! All models that ran produced meaningful changes.")
+            return
+        
+        # KEY METRICS
+        st.divider()
+        st.subheader("💸 Waste Metrics")
+        
+        total_cost = df[~view_mask]['cost'].sum()
+        wasted_cost = waste_df['cost'].sum()
+        wasted_model_executions = len(waste_df)
+        total_model_executions = len(df[~view_mask])
+        waste_pct = (wasted_cost / total_cost * 100) if total_cost > 0 else 0
+        waste_exec_pct = (wasted_model_executions / total_model_executions * 100) if total_model_executions > 0 else 0
+        avg_cost_per_wasted_execution = wasted_cost / wasted_model_executions if wasted_model_executions > 0 else 0
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric(
+                "Total Wasted Cost",
+                f"${wasted_cost:,.2f}",
+                delta=f"{waste_pct:.1f}% of total cost",
+                help="Money spent on model executions with zero or minimal changes"
+            )
+        
+        with col2:
+            st.metric(
+                "Wasted Executions",
+                f"{wasted_model_executions:,}",
+                delta=f"{waste_exec_pct:.1f}% of executions",
+                help="Number of model executions that produced minimal/no changes"
+            )
+        
+        with col3:
+            st.metric(
+                "Total Executions",
+                f"{total_model_executions:,}",
+                delta=f"{total_model_executions - wasted_model_executions:,} productive",
+                delta_color="normal",
+                help="Total model executions analyzed (excluding views)"
+            )
+        
+        with col4:
+            st.metric(
+                "Avg. Cost per Waste",
+                f"${avg_cost_per_wasted_execution:,.2f}",
+                help="Average cost per wasted execution (when waste occurs)"
+            )
+        
+        with col5:
+            # Annualized savings estimate
+            days_analyzed = (end_date - start_date).days if (end_date - start_date).days > 0 else 1
+            daily_waste = wasted_cost / days_analyzed
+            annual_savings = daily_waste * 365
+            st.metric(
+                "Annual Savings (Est.)",
+                f"${annual_savings:,.0f}",
+                help="Estimated annual savings if SAO eliminates this waste"
+            )
+        
+        st.info(f"💡 **With SAO enabled**, these {wasted_model_executions:,} model executions would have been automatically skipped, saving ${wasted_cost:,.2f}!")
+        
+        # WASTE BREAKDOWN
+        st.divider()
+        st.subheader("📊 Waste Breakdown")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Waste by category
+            st.markdown("**Waste by Category**")
+            category_waste = waste_df.groupby('waste_category').agg({
+                'cost': 'sum',
+                'unique_id': 'count'
+            }).reset_index()
+            category_waste.columns = ['Category', 'Total Cost', 'Count']
+            category_waste = category_waste.sort_values('Total Cost', ascending=False)
+            
+            fig = px.pie(
+                category_waste,
+                values='Total Cost',
+                names='Category',
+                title='Wasted Cost by Category',
+                hole=0.4
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Waste by materialization
+            st.markdown("**Waste by Model Type**")
+            mat_waste = waste_df.groupby('materialization').agg({
+                'cost': 'sum',
+                'unique_id': 'count'
+            }).reset_index()
+            mat_waste.columns = ['Materialization', 'Total Cost', 'Count']
+            mat_waste = mat_waste.sort_values('Total Cost', ascending=False)
+            
+            fig = px.bar(
+                mat_waste,
+                x='Materialization',
+                y='Total Cost',
+                title='Wasted Cost by Materialization Type',
+                text='Total Cost'
+            )
+            fig.update_traces(texttemplate='$%{text:.2f}', textposition='outside')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # WASTE OVER TIME
+        st.divider()
+        st.subheader("📈 Waste Over Time")
+        
+        # Aggregate by run
+        run_waste = df.groupby(['run_id', 'run_created_at', 'job_name']).agg({
+            'cost': 'sum',
+            'is_waste': lambda x: (x == True).sum()
+        }).reset_index()
+        run_waste.columns = ['run_id', 'run_created_at', 'job_name', 'total_cost', 'wasted_count']
+        
+        # Calculate wasted cost
+        waste_by_run = waste_df.groupby(['run_id']).agg({
+            'cost': 'sum'
+        }).reset_index()
+        waste_by_run.columns = ['run_id', 'wasted_cost']
+        
+        run_waste = run_waste.merge(waste_by_run, on='run_id', how='left')
+        run_waste['wasted_cost'] = run_waste['wasted_cost'].fillna(0)
+        run_waste = run_waste.sort_values('run_created_at')
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=run_waste['run_created_at'],
+            y=run_waste['wasted_cost'],
+            name='Wasted Cost',
+            mode='lines+markers',
+            line=dict(color='red', width=2),
+            fill='tozeroy'
+        ))
+        
+        fig.update_layout(
+            title='Wasted Cost Over Time',
+            xaxis_title='Run Date',
+            yaxis_title='Wasted Cost ($)',
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # TOP WASTERS
+        st.divider()
+        st.subheader("🔥 Top Wasters")
+        
+        # Aggregate by model - need total run count and waste count
+        model_waste = waste_df.groupby(['unique_id', 'name', 'materialization', 'waste_category']).agg({
+            'cost': 'sum',
+            'run_id': 'count',
+            'rows_affected_clean': 'mean',
+            'execution_time': 'mean'
+        }).reset_index()
+        model_waste.columns = ['unique_id', 'Model Name', 'Materialization', 'Waste Category', 
+                               'Total Wasted Cost', 'Waste Count', 'Avg Rows Changed', 'Avg Execution Time (s)']
+        
+        # Get total run count per model (including non-waste runs)
+        total_runs_per_model = df[~view_mask].groupby('unique_id')['run_id'].nunique().reset_index()
+        total_runs_per_model.columns = ['unique_id', 'Run Count']
+        
+        # Merge to get run count
+        model_waste = model_waste.merge(total_runs_per_model, on='unique_id', how='left')
+        
+        # Calculate waste percentage
+        model_waste['Waste %'] = (model_waste['Waste Count'] / model_waste['Run Count'] * 100).round(1)
+        
+        # Reorder columns
+        model_waste = model_waste[['unique_id', 'Model Name', 'Materialization', 'Waste Category', 
+                                   'Total Wasted Cost', 'Waste Count', 'Run Count', 'Waste %',
+                                   'Avg Rows Changed', 'Avg Execution Time (s)']]
+        
+        model_waste = model_waste.sort_values('Total Wasted Cost', ascending=False)
+        
+        # Show top 20
+        top_wasters = model_waste.head(20).copy()
+        
+        fig = px.bar(
+            top_wasters,
+            x='Total Wasted Cost',
+            y='Model Name',
+            orientation='h',
+            title='Top 20 Models by Wasted Cost',
+            color='Waste Category',
+            hover_data=['Materialization', 'Waste Count', 'Run Count', 'Waste %', 'Avg Rows Changed', 'Avg Execution Time (s)']
+        )
+        fig.update_layout(height=600, yaxis={'categoryorder': 'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # DETAILED TABLE
+        st.divider()
+        st.subheader("📋 Detailed Waste Analysis")
+        
+        # Format for display
+        display_waste = model_waste.copy()
+        display_waste['Total Wasted Cost'] = display_waste['Total Wasted Cost'].apply(lambda x: f"${x:.2f}")
+        display_waste['Waste %'] = display_waste['Waste %'].apply(lambda x: f"{x:.1f}%")
+        display_waste['Avg Rows Changed'] = display_waste['Avg Rows Changed'].apply(lambda x: f"{x:.1f}")
+        display_waste['Avg Execution Time (s)'] = display_waste['Avg Execution Time (s)'].apply(lambda x: f"{x:.2f}")
+        
+        # Drop unique_id for cleaner display
+        display_waste = display_waste.drop('unique_id', axis=1)
+        
+        st.dataframe(
+            display_waste,
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        st.caption(f"💡 **Waste %** shows how often each model wastes compute (Waste Count ÷ Run Count). Higher % = more consistent waste pattern.")
+        
+        # RECOMMENDATIONS
+        st.divider()
+        st.subheader("💡 Recommendations")
+        
+        st.markdown(f"""
+        ### Immediate Actions
+        1. **Enable SAO on these jobs**: Focus on jobs with the highest waste
+        2. **Review {len(model_waste)} models**: These consistently run with minimal/no changes
+        3. **Estimated Annual Savings**: ${annual_savings:,.0f} by implementing SAO
+        
+        ### Top Priority Models
+        The following models are your biggest opportunities:
+        """)
+        
+        priority_models = model_waste.head(5)
+        for idx, row in priority_models.iterrows():
+            st.markdown(f"- **{row['Model Name']}** ({row['Materialization']}): Wasted ${row['Total Wasted Cost']:.2f} across {int(row['Waste Count'])} runs")
+        
+        st.markdown("""
+        ### Implementation Steps
+        1. **Phase 1**: Enable SAO on scheduled jobs with highest waste
+        2. **Phase 2**: Add freshness checks to models that rebuild frequently
+        3. **Phase 3**: Extend to CI/merge jobs for full efficiency
+        
+        ### Expected Impact
+        - ✅ Immediate cost reduction
+        - ✅ Faster job completion times
+        - ✅ Reduced warehouse utilization
+        - ✅ More efficient data pipelines
+        """)
+        
+    except Exception as e:
+        st.error(f"❌ Error during waste analysis: {str(e)}")
+        st.exception(e)
+
+
 def show_job_overlap_analysis():
     """Show job overlap analysis to identify models run in multiple jobs."""
     st.header("🔀 Job Overlap Analysis")
@@ -3375,59 +3668,150 @@ def show_job_overlap_analysis():
     
     st.divider()
     
-    # Environment selection
-    col1, col2 = st.columns([2, 2])
+    # Unified configuration section
+    col1, col2, col3 = st.columns([2, 2, 1])
     
     with col1:
         environment_id_input = st.text_input(
-            "Environment ID (Optional)",
+            "Environment ID",
             value=config.get('environment_id', ''),
-            help="Leave blank to analyze all jobs in the account, or specify environment ID to filter",
-            key="overlap_environment_id"
+            help="Environment ID to analyze (required for SAO, optional for overlap)",
+            key="combined_environment_id"
         )
     
     with col2:
         job_types_filter = st.multiselect(
-            "Filter Job Types",
+            "Filter Job Types (for Overlap Analysis Only)",
             options=["ci", "merge", "scheduled", "other"],
             default=["scheduled"],
-            help="Which job types to analyze",
-            key="overlap_job_types"
+            help="Which job types to analyze for overlap",
+            key="combined_job_types"
         )
     
-    analyze_button = st.button("🔍 Analyze Job Overlap", type="primary", key="overlap_analyze", width='stretch')
+    with col3:
+        st.markdown("")
+        st.markdown("")
+        analyze_button = st.button("🔍 Analyze All", type="primary", key="combined_analyze", use_container_width=True)
     
     if not analyze_button:
-        st.info("⬆️ Click 'Analyze Job Overlap' to identify models run in multiple jobs")
+        st.info("⬆️ Click 'Analyze All' to run SAO adoption and job overlap analysis")
         
         with st.expander("📊 What You'll See"):
             st.markdown("""
-            ### Key Metrics
-            - **Total Jobs Analyzed**: Number of jobs successfully analyzed
-            - **Jobs Skipped**: Jobs excluded from analysis (currently running or never succeeded)
-            - **Total Models**: Unique models found
-            - **Overlapping Models**: Models run in multiple jobs
-            - **Overlap Rate**: % of models with duplication
+            ### SAO Adoption Analysis
+            - Overall SAO adoption metrics and charts
+            - Job type breakdown (CI, Merge, Scheduled, Other)
+            - List of jobs without SAO enabled
             
-            ### What Gets Skipped
-            Jobs are automatically excluded if:
-            - Currently running (Queued/Starting/Running status)
-            - Never completed successfully (no successful runs in history)
-            - Missing artifacts (run_results.json not available)
-            
-            ### Visualizations
-            - Bar chart of most duplicated models
-            - Table showing which jobs run which models
+            ### Job Overlap Analysis
+            - Models run in multiple jobs (redundant execution)
+            - Overlap metrics and visualizations
             - Recommendations for consolidation
             
-            ### Export
-            - Download detailed overlap report
-            - Model-to-jobs mapping
-            - Job-to-models mapping
+            **Note**: SAO analysis requires an Environment ID. Job overlap can run with or without one.
             """)
         return
     
-    # Fetch and analyze jobs
+    # Run SAO Analysis if environment ID provided
+    if environment_id_input:
+        st.subheader("🔄 SAO Adoption Analysis")
+        try:
+            env_id = int(environment_id_input)
+            
+            with st.spinner("🔄 Fetching jobs and analyzing SAO..."):
+                jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
+                headers = {'Authorization': f'Token {config["api_key"]}'}
+                params = {'limit': 100, 'environment_id': env_id}
+                
+                jobs_response = requests.get(jobs_url, headers=headers, params=params)
+                jobs_response.raise_for_status()
+                jobs = jobs_response.json().get('data', [])
+                
+                if jobs:
+                    # Count SAO jobs
+                    sao_jobs = [job for job in jobs if check_job_has_sao(job)]
+                    total_jobs = len(jobs)
+                    sao_count = len(sao_jobs)
+                    sao_pct = (sao_count / total_jobs * 100) if total_jobs > 0 else 0
+                    
+                    # Metrics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Jobs", f"{total_jobs:,}")
+                    with col2:
+                        st.metric("SAO-Enabled", f"{sao_count:,}", delta=f"{sao_pct:.1f}%")
+                    with col3:
+                        st.metric("Non-SAO", f"{total_jobs - sao_count:,}")
+                    
+                    # Charts
+                    chart_col1, chart_col2 = st.columns(2)
+                    chart_data = pd.DataFrame({
+                        'Category': ['SAO-Enabled', 'Non-SAO'],
+                        'Count': [sao_count, total_jobs - sao_count]
+                    })
+                    
+                    with chart_col1:
+                        fig_pie = px.pie(
+                            chart_data,
+                            values='Count',
+                            names='Category',
+                            title='SAO Adoption',
+                            color='Category',
+                            color_discrete_map={'SAO-Enabled': '#10b981', 'Non-SAO': '#6b7280'},
+                            hole=0.4
+                        )
+                        st.plotly_chart(fig_pie, use_container_width=True)
+                    
+                    with chart_col2:
+                        # Job type breakdown
+                        job_type_data = defaultdict(lambda: {'sao': 0, 'non_sao': 0})
+                        for job in jobs:
+                            job_type = determine_job_type(job.get('triggers', {}))
+                            if check_job_has_sao(job):
+                                job_type_data[job_type]['sao'] += 1
+                            else:
+                                job_type_data[job_type]['non_sao'] += 1
+                        
+                        breakdown_list = []
+                        for jt, counts in job_type_data.items():
+                            total = counts['sao'] + counts['non_sao']
+                            if total > 0:
+                                breakdown_list.append({
+                                    'Job Type': jt.upper(),
+                                    'SAO': counts['sao'],
+                                    'Non-SAO': counts['non_sao']
+                                })
+                        
+                        if breakdown_list:
+                            breakdown_df = pd.DataFrame(breakdown_list)
+                            fig_bar = go.Figure()
+                            fig_bar.add_trace(go.Bar(name='SAO', x=breakdown_df['Job Type'], y=breakdown_df['SAO'], marker_color='#10b981'))
+                            fig_bar.add_trace(go.Bar(name='Non-SAO', x=breakdown_df['Job Type'], y=breakdown_df['Non-SAO'], marker_color='#6b7280'))
+                            fig_bar.update_layout(title='SAO by Job Type', barmode='group', height=300)
+                            st.plotly_chart(fig_bar, use_container_width=True)
+                    
+                    # Non-SAO jobs list
+                    non_sao_jobs = [{'Job ID': j['id'], 'Job Name': j['name'], 'Type': determine_job_type(j.get('triggers', {})).upper()} 
+                                   for j in jobs if not check_job_has_sao(j)]
+                    
+                    if non_sao_jobs:
+                        with st.expander(f"💡 {len(non_sao_jobs)} Jobs Without SAO"):
+                            st.dataframe(pd.DataFrame(non_sao_jobs), use_container_width=True, hide_index=True)
+                    
+                    if sao_pct < 50:
+                        st.warning(f"⚠️ Only {sao_pct:.1f}% of jobs have SAO enabled. Consider enabling SAO to reduce compute costs and avoid model overlap.")
+                    else:
+                        st.success(f"✅ Good SAO adoption rate: {sao_pct:.1f}%")
+                else:
+                    st.warning("No jobs found for this environment")
+                    
+        except Exception as e:
+            st.error(f"❌ Error analyzing SAO: {str(e)}")
+    
+    # Run Job Overlap Analysis
+    st.divider()
+    st.subheader("🔀 Job Overlap Analysis")
+    
     try:
         progress_bar = st.progress(0)
         status_text = st.empty()

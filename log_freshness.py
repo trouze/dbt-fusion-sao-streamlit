@@ -205,6 +205,17 @@ class DBTFreshnessLogger:
                             completed_at = t.get('completed_at')
                             break
                 
+                # Get adapter response for row count information
+                adapter_response = result.get('adapter_response', {})
+                rows_affected = adapter_response.get('rows_affected')
+                message = result.get('message', '')
+                
+                # Get materialization type from manifest
+                materialization = None
+                if unique_id in manifest.get('nodes', {}):
+                    node = manifest['nodes'][unique_id]
+                    materialization = node.get('config', {}).get('materialized')
+                
                 # Store or update model data
                 if unique_id not in model_statuses:
                     model_statuses[unique_id] = {
@@ -215,6 +226,10 @@ class DBTFreshnessLogger:
                         'execution_time': execution_time,
                         'started_at': started_at,
                         'completed_at': completed_at,
+                        'rows_affected': rows_affected,
+                        'message': message,
+                        'materialization': materialization,
+                        'adapter_response': adapter_response,
                         'steps': [step_index]
                     }
                 else:
@@ -225,6 +240,10 @@ class DBTFreshnessLogger:
                         model_statuses[unique_id]['status'] = 'error'
                     elif status == 'success' and model_statuses[unique_id]['status'] != 'error':
                         model_statuses[unique_id]['status'] = 'success'
+                        # Update row count info for successful runs
+                        model_statuses[unique_id]['rows_affected'] = rows_affected
+                        model_statuses[unique_id]['message'] = message
+                        model_statuses[unique_id]['adapter_response'] = adapter_response
         
         # Convert to list
         models_list = list(model_statuses.values())
@@ -302,6 +321,17 @@ class DBTFreshnessLogger:
                         completed_at = t.get('completed_at')
                         break
             
+            # Get adapter response for row count information
+            adapter_response = result.get('adapter_response', {})
+            rows_affected = adapter_response.get('rows_affected')
+            message = result.get('message', '')
+            
+            # Get materialization type from manifest
+            materialization = None
+            if unique_id in manifest.get('nodes', {}):
+                node = manifest['nodes'][unique_id]
+                materialization = node.get('config', {}).get('materialized')
+            
             models_list.append({
                 'unique_id': unique_id,
                 'name': unique_id.split('.')[-1] if unique_id else 'unknown',
@@ -309,7 +339,11 @@ class DBTFreshnessLogger:
                 'status': status,
                 'execution_time': execution_time,
                 'started_at': started_at,
-                'completed_at': completed_at
+                'completed_at': completed_at,
+                'rows_affected': rows_affected,
+                'message': message,
+                'materialization': materialization,
+                'adapter_response': adapter_response
             })
         
         # Print summary
