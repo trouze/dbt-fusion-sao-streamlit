@@ -197,13 +197,19 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
         offset = 0
         page_num = 0
         runs_before_start = 0  # Track runs older than start_datetime
+        runs_after_end = 0  # Track runs newer than end_datetime
+        found_any_in_range = False  # Have we found at least one run in range?
         
         while len(all_runs) < limit:
             page_limit = min(API_MAX_LIMIT, limit - len(all_runs))
             page_num += 1
             
             if progress_callback:
-                progress_callback(f"Fetching runs (page {page_num}, found {len(all_runs)} so far)...", len(all_runs))
+                if not found_any_in_range and page_num > 5:
+                    # Haven't found any in-range runs yet and we're deep in pagination
+                    progress_callback(f"Searching for runs in date range (page {page_num}, {runs_after_end} too new)...", len(all_runs))
+                else:
+                    progress_callback(f"Fetching runs (page {page_num}, found {len(all_runs)} so far)...", len(all_runs))
             
             params = {
                 'limit': page_limit,
@@ -229,6 +235,7 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                 
                 # Track runs added from this page
                 runs_added_this_page = 0
+                too_new_this_page = 0
                 
                 # Filter by date and deduplicate
                 for run in page_runs:
@@ -245,6 +252,8 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                             
                             # Skip if too new
                             if created_at > end_datetime:
+                                runs_after_end += 1
+                                too_new_this_page += 1
                                 continue
                             
                             # If too old, increment counter
@@ -256,6 +265,7 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                             seen_run_ids.add(run_id)
                             all_runs.append(run)
                             runs_added_this_page += 1
+                            found_any_in_range = True
                             
                             # Stop if we've hit our limit
                             if len(all_runs) >= limit:
@@ -264,17 +274,25 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                         except:
                             pass
                 
-                # EARLY STOP: If we've gone past the start date (runs ordered newest-first)
-                # and we've seen multiple old runs, we won't find any more in range
-                if runs_before_start >= API_MAX_LIMIT:
-                    if progress_callback:
-                        progress_callback(f"Stopped early - reached runs before {start_datetime.date()}", len(all_runs))
-                    break
-                
-                # EARLY STOP: If we've collected enough runs
+                # EARLY STOP CONDITION 1: Hit the limit
                 if len(all_runs) >= limit:
                     if progress_callback:
                         progress_callback(f"Collected {len(all_runs)} runs (limit reached)", len(all_runs))
+                    break
+                
+                # EARLY STOP CONDITION 2: Gone past the start date (runs too old)
+                # Once we've found runs in range, if we see 100+ old runs, we're done
+                if found_any_in_range and runs_before_start >= API_MAX_LIMIT:
+                    if progress_callback:
+                        progress_callback(f"Stopped - passed start date {start_datetime.date()}", len(all_runs))
+                    break
+                
+                # EARLY STOP CONDITION 3: Too many pages of runs that are too NEW
+                # If we haven't found ANY runs in range yet, but we've checked 50+ pages
+                # (5,000+ runs all newer than end_datetime), something is wrong or date range is way too old
+                if not found_any_in_range and page_num >= 50:
+                    if progress_callback:
+                        progress_callback(f"Stopped - no runs found in date range after {page_num} pages", len(all_runs))
                     break
                 
                 # If we got fewer runs than requested, we've reached the end
