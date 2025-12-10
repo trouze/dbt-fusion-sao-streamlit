@@ -166,7 +166,7 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                           environment_id: str = None, status: List[int] = None, limit: int = 500,
                           progress_callback=None):
     """
-    Fetch runs across ALL jobs in a date range.
+    Fetch runs across ALL jobs in a date range using API-native date filtering.
     
     Args:
         api_base: dbt Cloud API base URL
@@ -193,30 +193,28 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
     if status is None:
         status = [10]
     
+    # Format datetimes for API (ISO 8601 with Z timezone)
+    start_iso = start_datetime.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_iso = end_datetime.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
     for status_code in status:
         offset = 0
         page_num = 0
-        runs_before_start = 0  # Track runs older than start_datetime
-        runs_after_end = 0  # Track runs newer than end_datetime
-        found_any_in_range = False  # Have we found at least one run in range?
         
         while len(all_runs) < limit:
             page_limit = min(API_MAX_LIMIT, limit - len(all_runs))
             page_num += 1
             
             if progress_callback:
-                if not found_any_in_range and page_num > 5:
-                    # Haven't found any in-range runs yet and we're deep in pagination
-                    progress_callback(f"Searching for runs in date range (page {page_num}, {runs_after_end} too new)...", len(all_runs))
-                else:
-                    progress_callback(f"Fetching runs (page {page_num}, found {len(all_runs)} so far)...", len(all_runs))
+                progress_callback(f"Fetching runs (page {page_num}, found {len(all_runs)} so far)...", len(all_runs))
             
             params = {
                 'limit': page_limit,
                 'offset': offset,
                 'order_by': '-id',
                 'include_related': '["job","trigger","environment","repository"]',
-                'status': status_code
+                'status': status_code,
+                'created_at__range': f'["{start_iso}","{end_iso}"]'  # SERVER-SIDE date filtering!
             }
             
             # Add environment filter if provided
@@ -231,68 +229,23 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                 page_runs = data.get('data', [])
                 
                 if not page_runs:
-                    break
+                    break  # No more runs in date range
                 
-                # Track runs added from this page
-                runs_added_this_page = 0
-                too_new_this_page = 0
-                
-                # Filter by date and deduplicate
+                # Deduplicate and add runs
                 for run in page_runs:
                     run_id = run.get('id')
-                    created_at_str = run.get('created_at')
-                    
-                    if run_id in seen_run_ids:
-                        continue
-                    
-                    if created_at_str:
-                        try:
-                            created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
-                            created_at = created_at.replace(tzinfo=None)
-                            
-                            # Skip if too new
-                            if created_at > end_datetime:
-                                runs_after_end += 1
-                                too_new_this_page += 1
-                                continue
-                            
-                            # If too old, increment counter
-                            if created_at < start_datetime:
-                                runs_before_start += 1
-                                continue
-                            
-                            # Within date range!
-                            seen_run_ids.add(run_id)
-                            all_runs.append(run)
-                            runs_added_this_page += 1
-                            found_any_in_range = True
-                            
-                            # Stop if we've hit our limit
-                            if len(all_runs) >= limit:
-                                break
-                            
-                        except:
-                            pass
+                    if run_id and run_id not in seen_run_ids:
+                        seen_run_ids.add(run_id)
+                        all_runs.append(run)
+                        
+                        # Stop if we've hit our limit
+                        if len(all_runs) >= limit:
+                            break
                 
-                # EARLY STOP CONDITION 1: Hit the limit
+                # If we've hit our limit, stop
                 if len(all_runs) >= limit:
                     if progress_callback:
                         progress_callback(f"Collected {len(all_runs)} runs (limit reached)", len(all_runs))
-                    break
-                
-                # EARLY STOP CONDITION 2: Gone past the start date (runs too old)
-                # Once we've found runs in range, if we see 100+ old runs, we're done
-                if found_any_in_range and runs_before_start >= API_MAX_LIMIT:
-                    if progress_callback:
-                        progress_callback(f"Stopped - passed start date {start_datetime.date()}", len(all_runs))
-                    break
-                
-                # EARLY STOP CONDITION 3: Too many pages of runs that are too NEW
-                # If we haven't found ANY runs in range yet, but we've checked 50+ pages
-                # (5,000+ runs all newer than end_datetime), something is wrong or date range is way too old
-                if not found_any_in_range and page_num >= 50:
-                    if progress_callback:
-                        progress_callback(f"Stopped - no runs found in date range after {page_num} pages", len(all_runs))
                     break
                 
                 # If we got fewer runs than requested, we've reached the end
