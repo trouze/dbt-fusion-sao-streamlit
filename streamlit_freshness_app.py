@@ -3382,11 +3382,11 @@ def show_pre_sao_waste_analysis():
         
         total_cost = df[~view_mask]['cost'].sum()
         wasted_cost = waste_df['cost'].sum()
-        wasted_runs = len(waste_df)
+        wasted_model_executions = len(waste_df)
+        total_model_executions = len(df[~view_mask])
         waste_pct = (wasted_cost / total_cost * 100) if total_cost > 0 else 0
-        num_runs = df['run_id'].nunique()
-        avg_cost_per_run = total_cost / num_runs if num_runs > 0 else 0
-        avg_waste_per_run = wasted_cost / num_runs if num_runs > 0 else 0
+        waste_exec_pct = (wasted_model_executions / total_model_executions * 100) if total_model_executions > 0 else 0
+        avg_cost_per_wasted_execution = wasted_cost / wasted_model_executions if wasted_model_executions > 0 else 0
         
         col1, col2, col3, col4, col5 = st.columns(5)
         
@@ -3394,31 +3394,32 @@ def show_pre_sao_waste_analysis():
             st.metric(
                 "Total Wasted Cost",
                 f"${wasted_cost:,.2f}",
-                delta=f"{waste_pct:.1f}% of total",
-                help="Money spent on model runs with zero or minimal changes"
+                delta=f"{waste_pct:.1f}% of total cost",
+                help="Money spent on model executions with zero or minimal changes"
             )
         
         with col2:
             st.metric(
                 "Wasted Executions",
-                f"{wasted_runs:,}",
-                delta=f"{(wasted_runs/len(df[~view_mask])*100):.1f}% of runs",
+                f"{wasted_model_executions:,}",
+                delta=f"{waste_exec_pct:.1f}% of executions",
                 help="Number of model executions that produced minimal/no changes"
             )
         
         with col3:
             st.metric(
-                "Avg. Cost per Run",
-                f"${avg_cost_per_run:,.2f}",
-                help="Average total cost per job run (baseline)"
+                "Total Executions",
+                f"{total_model_executions:,}",
+                delta=f"{total_model_executions - wasted_model_executions:,} productive",
+                delta_color="normal",
+                help="Total model executions analyzed (excluding views)"
             )
         
         with col4:
             st.metric(
-                "Avg. Waste per Run",
-                f"${avg_waste_per_run:,.2f}",
-                delta=f"{(avg_waste_per_run/avg_cost_per_run*100):.1f}% of avg" if avg_cost_per_run > 0 else None,
-                help="Average wasted cost per job run"
+                "Avg. Cost per Waste",
+                f"${avg_cost_per_wasted_execution:,.2f}",
+                help="Average cost per wasted execution (when waste occurs)"
             )
         
         with col5:
@@ -3432,7 +3433,7 @@ def show_pre_sao_waste_analysis():
                 help="Estimated annual savings if SAO eliminates this waste"
             )
         
-        st.info(f"💡 **With SAO enabled**, these {wasted_runs:,} model executions would have been automatically skipped, saving ${wasted_cost:,.2f}!")
+        st.info(f"💡 **With SAO enabled**, these {wasted_model_executions:,} model executions would have been automatically skipped, saving ${wasted_cost:,.2f}!")
         
         # WASTE BREAKDOWN
         st.divider()
