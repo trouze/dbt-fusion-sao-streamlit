@@ -6,6 +6,38 @@ Try here:
 https://dbt-fusion-sao.streamlit.app/
 
 
+## ✨ What's New in v2.10.0
+
+### 🗑️ Pre-SAO Waste Analysis (NEW!)
+
+Complete **waste analysis** to identify and quantify models that run but produce minimal or no changes - the primary use case for State-Aware Orchestration (SAO):
+
+**Waste Detection:**
+- Automatically excludes view models (don't drive warehouse costs)
+- Identifies zero-change table models (0 rows affected)
+- Detects low-change incrementals (configurable threshold)
+- Uses `adapter_response.rows_affected` from run_results.json
+
+**Key Metrics:**
+- Total wasted cost and percentage of compute spend
+- Count of wasteful executions
+- Average waste per run
+- Annualized savings estimate with SAO
+
+**Visualizations:**
+- Waste breakdown by category (zero vs. low change)
+- Waste by materialization type (table, incremental, etc.)
+- Waste trends over time
+- Top 20 models with highest wasted cost
+
+**ROI Analysis:**
+- Detailed model-level breakdown
+- Priority recommendations for SAO enablement
+- Implementation roadmap
+- Expected impact metrics
+
+---
+
 ## ✨ What's New in v2.9.0
 
 ### 🎯 Enhanced SAO Adoption Analysis
@@ -92,7 +124,7 @@ You're ready to go! These credentials will be used across all tabs.
 
 ## 📊 Features
 
-The app provides six main tabs:
+The app provides seven main tabs:
 
 ### Tab 1: ⚙️ Configuration (Start Here!)
 
@@ -104,7 +136,42 @@ One-time setup for your dbt Cloud credentials and default job settings.
 
 **Perfect for**: First-time setup, switching between jobs/environments
 
-### Tab 2: 🎯 Environment Overview (Main Dashboard)
+### Tab 2: 🗑️ Pre-SAO Waste Analysis (NEW!)
+
+**Identify and quantify wasted compute** from models that run but produce minimal/no changes:
+- **Intelligent Waste Detection**: Automatically identifies zero-change and low-change executions
+- **View Exclusion**: Excludes view models (don't drive warehouse costs)
+- **Configurable Threshold**: Set minimum row count for "meaningful" changes
+- **Cost Quantification**: Calculate exact dollar amount wasted
+- **Annual Savings Estimate**: Project yearly savings with SAO implementation
+- **Waste Breakdown**: By category (zero vs. low change) and materialization type
+- **Trend Analysis**: Track waste over time across runs
+- **Top Wasters**: Identify the 20 models with highest wasted cost
+- **Model-Level Detail**: Comprehensive breakdown with waste count and average rows changed
+- **Priority Recommendations**: Actionable steps for SAO implementation
+- **Historical Job Support**: Includes data from deleted/archived jobs
+
+**Perfect for**: Pre-SAO planning, ROI justification, prioritizing SAO rollout
+
+**Data Source**: Uses `adapter_response.rows_affected` from `run_results.json` for accurate row counts
+
+### Tab 3: 🔀 Job Overlap Analysis
+
+**Identify models being run by multiple jobs** (pre-SAO optimization):
+- **Job Inventory**: List all jobs in the environment
+- **Overlap Detection**: Find models executed in multiple jobs
+- **Overlap Ranking**: Bar chart of most duplicated models
+- **Waste Calculation**: Quantify redundant executions
+- **Job-to-Job Matrix**: Visual overlap between jobs
+- **Priority Recommendations**: Based on overlap severity
+- **Export Options**: Download mappings and reports
+- **SAO Adoption Metrics**: Comprehensive SAO analysis with visualizations
+
+**Perfect for**: Pre-SAO consolidation, identifying redundant job runs, optimization opportunities
+
+**Note**: Best for environments without SAO or during job consolidation projects
+
+### Tab 4: 📋 Model Details
 
 **Your primary source of truth** for environment-wide health and performance:
 - Real-time status from dbt Cloud GraphQL API
@@ -124,7 +191,7 @@ One-time setup for your dbt Cloud credentials and default job settings.
 
 **Note**: Requires Environment ID to be configured
 
-### Tab 3: 📋 Model Details
+### Tab 4: 📋 Model Details
 
 **Deep dive into individual model configurations** from job manifest (with package analysis):
 - **Flexible Source Selection**:
@@ -149,7 +216,7 @@ One-time setup for your dbt Cloud credentials and default job settings.
 
 **Note**: Uses job manifest data (point-in-time snapshot)
 
-### Tab 4: 📈 Historical Trends
+### Tab 5: 📈 Historical Trends
 
 **Analyze performance patterns** across multiple job runs over time:
 - **⚡ Parallel processing**: Analyzes up to 10 runs simultaneously for 5-10x faster results
@@ -170,7 +237,7 @@ One-time setup for your dbt Cloud credentials and default job settings.
 
 **Note**: Best with 20-50 runs for meaningful trends
 
-### Tab 5: 💰 Cost Analysis
+### Tab 6: 💰 Cost Analysis
 
 **Quantify the financial impact** of your dbt optimization efforts:
 - **Run Status Filtering** - Analyze costs for Success, Error, or Cancelled runs
@@ -190,21 +257,6 @@ One-time setup for your dbt Cloud credentials and default job settings.
 **Perfect for**: Stakeholder reporting, optimization prioritization, budget planning
 
 **Note**: Supports Snowflake pricing with customizable cost per hour
-
-### Tab 6: 🔀 Job Overlap Analysis (NEW!)
-
-**Identify models being run by multiple jobs** (pre-SAO optimization):
-- **Job Inventory**: List all jobs in the environment
-- **Overlap Detection**: Find models executed in multiple jobs
-- **Overlap Ranking**: Bar chart of most duplicated models
-- **Waste Calculation**: Quantify redundant executions
-- **Job-to-Job Matrix**: Visual overlap between jobs
-- **Priority Recommendations**: Based on overlap severity
-- **Export Options**: Download mappings and reports
-
-**Perfect for**: Pre-SAO environments, job consolidation, reducing waste, audit efficiency
-
-**Note**: In environments without State-Aware Orchestration (SAO), multiple jobs may unnecessarily run the same models. This analysis helps identify and eliminate that waste.
 
 ## 🎯 Key Metrics Explained
 

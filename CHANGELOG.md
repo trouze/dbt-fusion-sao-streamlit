@@ -1,5 +1,99 @@
 # Changelog
 
+## [2.10.0] - December 10, 2025
+
+### Tab Reorganization 🔄
+
+Reordered tabs to prioritize the most actionable analyses:
+1. ⚙️ Configuration
+2. 🗑️ Pre-SAO Waste Analysis (NEW - moved to #2)
+3. 🔀 Job Overlap Analysis (moved to #3)
+4. 📋 Model Details
+5. 📈 Historical Trends
+6. 💰 Cost Analysis
+
+**Rationale**: Waste Analysis and Job Overlap are the most critical for SAO planning and should be easily accessible.
+
+### Major Feature: Pre-SAO Waste Analysis 🗑️
+
+Added comprehensive waste analysis to identify models that run but produce minimal or no changes - the primary use case for State-Aware Orchestration (SAO).
+
+#### New Pre-SAO Waste Analysis Tab
+
+**Enhanced Historical Job Support:**
+- Now fetches runs by date range FIRST, then enriches with job metadata
+- Captures data from deleted/archived jobs (not just current jobs)
+- Shows which jobs are active vs. historical/deleted
+- Job statistics breakdown with inactive job details
+
+**Real-Time Progress Updates:**
+- Progress callbacks during API pagination
+- Shows page number and count during fetching
+- Separate progress for runs and job metadata
+- Better user feedback during long operations
+
+**Waste Detection:**
+- **View Models**: Automatically excluded from cost calculations (don't drive warehouse costs)
+- **Zero-Change Models**: Table models that rebuild with 0 rows affected
+- **Low-Change Incrementals**: Incremental models with very few new rows (configurable threshold)
+- Parses `adapter_response.rows_affected` from `run_results.json` for accurate row counts
+
+**Key Metrics:**
+- Total Wasted Cost: Money spent on zero/low-change executions
+- Wasted Executions: Count of wasteful model runs
+- Average Waste per Run: Per-job waste tracking
+- Annual Savings Estimate: Projected yearly savings with SAO
+
+**Visualizations:**
+- 📊 Waste by Category (pie chart): Zero changes vs. low changes
+- 📊 Waste by Model Type (bar chart): Breakdown by materialization
+- 📈 Waste Over Time (line chart): Trend analysis across runs
+- 🔥 Top 20 Wasters (horizontal bar): Models with highest wasted cost
+
+**Detailed Analysis:**
+- Model-level breakdown with waste category, count, average rows changed
+- Job-level aggregation showing waste per run
+- Priority recommendations for SAO implementation
+- ROI estimates based on historical waste patterns
+
+**Configuration Options:**
+- Warehouse size and cost per hour (for cost calculations)
+- Minimum rows threshold (for "low change" detection)
+- Job source (all jobs or specific job)
+- Date range and max runs to analyze
+
+#### Enhanced Data Collection (log_freshness.py)
+
+**Extended Model Data:**
+- Added `rows_affected` extraction from `adapter_response`
+- Added `materialization` type (view, table, incremental, etc.)
+- Added `adapter_response` full object for detailed analysis
+- Added `message` field for additional context
+
+**Multi-Step Aggregation:**
+- Properly aggregates row counts across multiple dbt steps
+- Preserves row change information for successful runs
+- Handles both single and multi-step run processing
+
+#### Use Cases
+
+**Before SAO Implementation:**
+- Quantify potential savings to justify SAO adoption
+- Identify which jobs/models waste the most compute
+- Prioritize SAO rollout based on ROI
+
+**After Partial SAO:**
+- Identify remaining non-SAO jobs with waste
+- Track waste reduction over time
+- Validate SAO effectiveness
+
+**Continuous Optimization:**
+- Monitor for new waste patterns
+- Identify models that should have freshness checks
+- Track annual cost impact
+
+---
+
 ## [2.9.0] - November 28, 2025
 
 ### Major Feature: Enhanced SAO Adoption Analysis 🎯
