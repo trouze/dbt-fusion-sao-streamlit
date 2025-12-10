@@ -196,6 +196,7 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
     for status_code in status:
         offset = 0
         page_num = 0
+        runs_before_start = 0  # Track runs older than start_datetime
         
         while len(all_runs) < limit:
             page_limit = min(API_MAX_LIMIT, limit - len(all_runs))
@@ -226,6 +227,9 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                 if not page_runs:
                     break
                 
+                # Track runs added from this page
+                runs_added_this_page = 0
+                
                 # Filter by date and deduplicate
                 for run in page_runs:
                     run_id = run.get('id')
@@ -239,15 +243,39 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                             created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
                             created_at = created_at.replace(tzinfo=None)
                             
-                            # Skip if outside date range
-                            if created_at < start_datetime or created_at > end_datetime:
+                            # Skip if too new
+                            if created_at > end_datetime:
                                 continue
                             
+                            # If too old, increment counter
+                            if created_at < start_datetime:
+                                runs_before_start += 1
+                                continue
+                            
+                            # Within date range!
                             seen_run_ids.add(run_id)
                             all_runs.append(run)
+                            runs_added_this_page += 1
+                            
+                            # Stop if we've hit our limit
+                            if len(all_runs) >= limit:
+                                break
                             
                         except:
                             pass
+                
+                # EARLY STOP: If we've gone past the start date (runs ordered newest-first)
+                # and we've seen multiple old runs, we won't find any more in range
+                if runs_before_start >= API_MAX_LIMIT:
+                    if progress_callback:
+                        progress_callback(f"Stopped early - reached runs before {start_datetime.date()}", len(all_runs))
+                    break
+                
+                # EARLY STOP: If we've collected enough runs
+                if len(all_runs) >= limit:
+                    if progress_callback:
+                        progress_callback(f"Collected {len(all_runs)} runs (limit reached)", len(all_runs))
+                    break
                 
                 # If we got fewer runs than requested, we've reached the end
                 if len(page_runs) < page_limit:
