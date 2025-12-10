@@ -3323,17 +3323,51 @@ def show_pre_sao_waste_analysis():
         # 2. For non-views that executed (status = success)
         executed_mask = (df['status'] == 'success') & (~view_mask)
         
-        # 3. Zero-change models (rows_affected = 0 or None treated as 0)
+        # 3. Clean rows_affected for analysis
         df['rows_affected_clean'] = df['rows_affected'].fillna(0).astype(float)
-        zero_change_mask = executed_mask & (df['rows_affected_clean'] == 0)
-        df.loc[zero_change_mask, 'waste_category'] = 'Zero Changes'
-        df.loc[zero_change_mask, 'is_waste'] = True
         
-        # 4. Low-change incrementals
-        incremental_mask = executed_mask & (df['materialization'] == 'incremental')
-        low_change_mask = incremental_mask & (df['rows_affected_clean'] > 0) & (df['rows_affected_clean'] <= min_rows_threshold)
-        df.loc[low_change_mask, 'waste_category'] = f'Low Changes (<={min_rows_threshold} rows)'
-        df.loc[low_change_mask, 'is_waste'] = True
+        # 4. Analyze patterns PER MODEL to categorize waste intelligently
+        for unique_id in df[executed_mask]['unique_id'].unique():
+            model_runs = df[(df['unique_id'] == unique_id) & executed_mask]
+            
+            if len(model_runs) == 0:
+                continue
+            
+            # Count zero and non-zero runs
+            zero_runs = (model_runs['rows_affected_clean'] == 0).sum()
+            total_runs = len(model_runs)
+            zero_pct = zero_runs / total_runs if total_runs > 0 else 0
+            
+            # Get materialization
+            materialization = model_runs['materialization'].iloc[0] if len(model_runs) > 0 else None
+            
+            # Pattern Detection:
+            if zero_runs == total_runs and total_runs >= 2:
+                # ALWAYS ZERO: All runs have 0 changes (likely deprecated/unused table)
+                df.loc[(df['unique_id'] == unique_id) & executed_mask, 'waste_category'] = 'Always Zero (Deprecated?)'
+                df.loc[(df['unique_id'] == unique_id) & executed_mask, 'is_waste'] = True
+                
+            elif zero_pct >= 0.3 and zero_runs >= 2:
+                # SPORADIC ZEROS: ≥30% of runs are zero (e.g., weekends, periodic patterns)
+                zero_mask = (df['unique_id'] == unique_id) & executed_mask & (df['rows_affected_clean'] == 0)
+                df.loc[zero_mask, 'waste_category'] = 'Sporadic Zeros (Periodic Pattern?)'
+                df.loc[zero_mask, 'is_waste'] = True
+                
+            elif zero_runs > 0:
+                # OCCASIONAL ZEROS: Some zero runs but not a pattern
+                zero_mask = (df['unique_id'] == unique_id) & executed_mask & (df['rows_affected_clean'] == 0)
+                df.loc[zero_mask, 'waste_category'] = 'Occasional Zero Changes'
+                df.loc[zero_mask, 'is_waste'] = True
+                
+            # Check for low-change incrementals (even if they never hit zero)
+            if materialization == 'incremental':
+                low_change_mask = (df['unique_id'] == unique_id) & executed_mask & \
+                                  (df['rows_affected_clean'] > 0) & \
+                                  (df['rows_affected_clean'] <= min_rows_threshold)
+                
+                if low_change_mask.sum() > 0:
+                    df.loc[low_change_mask, 'waste_category'] = f'Low Changes (<={min_rows_threshold} rows)'
+                    df.loc[low_change_mask, 'is_waste'] = True
         
         # Calculate waste metrics
         waste_df = df[df['is_waste'] == True].copy()
@@ -3350,8 +3384,11 @@ def show_pre_sao_waste_analysis():
         wasted_cost = waste_df['cost'].sum()
         wasted_runs = len(waste_df)
         waste_pct = (wasted_cost / total_cost * 100) if total_cost > 0 else 0
+        num_runs = df['run_id'].nunique()
+        avg_cost_per_run = total_cost / num_runs if num_runs > 0 else 0
+        avg_waste_per_run = wasted_cost / num_runs if num_runs > 0 else 0
         
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
             st.metric(
@@ -3370,14 +3407,21 @@ def show_pre_sao_waste_analysis():
             )
         
         with col3:
-            avg_waste_per_run = wasted_cost / df['run_id'].nunique() if df['run_id'].nunique() > 0 else 0
             st.metric(
-                "Avg Waste per Run",
-                f"${avg_waste_per_run:,.2f}",
-                help="Average wasted cost per job run"
+                "Avg. Cost per Run",
+                f"${avg_cost_per_run:,.2f}",
+                help="Average total cost per job run (baseline)"
             )
         
         with col4:
+            st.metric(
+                "Avg. Waste per Run",
+                f"${avg_waste_per_run:,.2f}",
+                delta=f"{(avg_waste_per_run/avg_cost_per_run*100):.1f}% of avg" if avg_cost_per_run > 0 else None,
+                help="Average wasted cost per job run"
+            )
+        
+        with col5:
             # Annualized savings estimate
             days_analyzed = (end_date - start_date).days if (end_date - start_date).days > 0 else 1
             daily_waste = wasted_cost / days_analyzed
@@ -3480,7 +3524,7 @@ def show_pre_sao_waste_analysis():
         st.divider()
         st.subheader("🔥 Top Wasters")
         
-        # Aggregate by model
+        # Aggregate by model - need total run count and waste count
         model_waste = waste_df.groupby(['unique_id', 'name', 'materialization', 'waste_category']).agg({
             'cost': 'sum',
             'run_id': 'count',
@@ -3489,6 +3533,22 @@ def show_pre_sao_waste_analysis():
         }).reset_index()
         model_waste.columns = ['unique_id', 'Model Name', 'Materialization', 'Waste Category', 
                                'Total Wasted Cost', 'Waste Count', 'Avg Rows Changed', 'Avg Execution Time (s)']
+        
+        # Get total run count per model (including non-waste runs)
+        total_runs_per_model = df[~view_mask].groupby('unique_id')['run_id'].nunique().reset_index()
+        total_runs_per_model.columns = ['unique_id', 'Run Count']
+        
+        # Merge to get run count
+        model_waste = model_waste.merge(total_runs_per_model, on='unique_id', how='left')
+        
+        # Calculate waste percentage
+        model_waste['Waste %'] = (model_waste['Waste Count'] / model_waste['Run Count'] * 100).round(1)
+        
+        # Reorder columns
+        model_waste = model_waste[['unique_id', 'Model Name', 'Materialization', 'Waste Category', 
+                                   'Total Wasted Cost', 'Waste Count', 'Run Count', 'Waste %',
+                                   'Avg Rows Changed', 'Avg Execution Time (s)']]
+        
         model_waste = model_waste.sort_values('Total Wasted Cost', ascending=False)
         
         # Show top 20
@@ -3501,7 +3561,7 @@ def show_pre_sao_waste_analysis():
             orientation='h',
             title='Top 20 Models by Wasted Cost',
             color='Waste Category',
-            hover_data=['Materialization', 'Waste Count', 'Avg Rows Changed', 'Avg Execution Time (s)']
+            hover_data=['Materialization', 'Waste Count', 'Run Count', 'Waste %', 'Avg Rows Changed', 'Avg Execution Time (s)']
         )
         fig.update_layout(height=600, yaxis={'categoryorder': 'total ascending'})
         st.plotly_chart(fig, use_container_width=True)
@@ -3513,14 +3573,20 @@ def show_pre_sao_waste_analysis():
         # Format for display
         display_waste = model_waste.copy()
         display_waste['Total Wasted Cost'] = display_waste['Total Wasted Cost'].apply(lambda x: f"${x:.2f}")
+        display_waste['Waste %'] = display_waste['Waste %'].apply(lambda x: f"{x:.1f}%")
         display_waste['Avg Rows Changed'] = display_waste['Avg Rows Changed'].apply(lambda x: f"{x:.1f}")
         display_waste['Avg Execution Time (s)'] = display_waste['Avg Execution Time (s)'].apply(lambda x: f"{x:.2f}")
+        
+        # Drop unique_id for cleaner display
+        display_waste = display_waste.drop('unique_id', axis=1)
         
         st.dataframe(
             display_waste,
             use_container_width=True,
             hide_index=True
         )
+        
+        st.caption(f"💡 **Waste %** shows how often each model wastes compute (Waste Count ÷ Run Count). Higher % = more consistent waste pattern.")
         
         # RECOMMENDATIONS
         st.divider()
