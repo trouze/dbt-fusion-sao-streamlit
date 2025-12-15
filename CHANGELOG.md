@@ -1,5 +1,421 @@
 # Changelog
 
+## [2.10.4] - December 15, 2025
+
+### Improvement: Job State Filtering - Correct by Tab 🎯
+
+**Change**: Properly configured which tabs show ALL jobs vs ACTIVE jobs only.
+
+**ALL jobs (state='all') - for historical/cost analysis:**
+- ✅ Pre-SAO Waste Analysis (has toggle, defaults to include deleted)
+- ✅ Historical Trends (has toggle, defaults to include deleted)
+- ✅ Cost Analysis (has toggle, defaults to include deleted)
+
+**ACTIVE jobs only (state=1) - for current operations:**
+- ✅ Job Overlap Analysis - Both sections (SAO Adoption + Job Overlap)
+- ✅ Model Details (only shows active jobs)
+
+**Why this matters:**
+- Cost and waste analysis needs to include deleted jobs to capture all historical spend
+- Job overlap and SAO adoption should only look at current active jobs (~10 instead of ~105)
+- Model details should only show active job runs for current debugging
+
+**Files Updated:**
+- `streamlit_freshness_app.py` - Updated job state filtering across all tabs
+
+---
+
+## [2.10.3] - December 15, 2025
+
+### CRITICAL FIX: Use Step Index Instead of Step ID for Artifacts 🐛
+
+**The Bug:**
+
+We were using `step.get('id')` (e.g., `1939782949`) instead of `step.get('index')` (e.g., `6`) when fetching artifacts!
+
+**Symptoms:**
+- Steps matched correctly: `✅ MATCHED: invoke dbt with dbt build --selector incremental`
+- But artifacts always 404: `⚠️ No run_results.json found for step 1939782949 (404)`
+- 200 runs fetched, but 0 had model data
+
+**Root Cause:**
+
+The dbt Cloud Artifacts API expects the **step index** (1-7), not the **step ID** (1939782949):
+
+```python
+# ❌ WRONG (was doing this):
+step_id = step.get('id')  # Returns 1939782949
+params = {'step': step_id}
+# URL: .../run_results.json?step=1939782949  → 404 Not Found
+
+# ✅ CORRECT (now doing this):
+step_index = step.get('index')  # Returns 6
+params = {'step': step_index}
+# URL: .../run_results.json?step=6  → 200 OK
+```
+
+**The Fix:**
+
+Changed line 1433 and 1445 in `streamlit_freshness_app.py`:
+- Store `step.get('index')` instead of `step.get('id')`
+- Updated all debug messages to show "step index" for clarity
+
+**Verification:**
+
+Run 405748634, Step 6 ("Invoke dbt build --selector incremental"):
+- Before: `?step=1939782949` → 404 Not Found
+- After: `?step=6` → 200 OK with model data
+
+**Impact:**
+
+This fixes the "0 runs with model data" issue! Now artifacts will be fetched correctly and Pre-SAO Waste Analysis will show actual model execution data.
+
+---
+
+## [2.10.3] - December 15, 2025 (earlier)
+
+### Enhanced Debug Logging: Track Artifact Fetching 🔍
+
+**User Report:**
+Steps are being matched correctly (✅ MATCHED in console), but UI still shows "0 runs with model data". This suggests the issue is in artifact fetching or result parsing.
+
+**Debug Logging Added:**
+
+Now tracks the complete flow from step matching → artifact fetching → result parsing:
+
+```
+DEBUG Run 447753882: Found 7 total steps:
+  ✅ MATCHED: invoke dbt with `dbt run -s stg_snowflake__users`
+✅ Run 447753882: Found 1 relevant step(s)
+  📥 Fetching run_results.json for step 2134432923...
+  ✅ Got 15 results from step 2134432923
+  📊 Total unique results so far: 15
+✅ Run 447753882: Found 15 total results, now filtering to models...
+  📊 Result types in run_results.json: {'model': 12, 'test': 3}
+✅ Run 447753882: Extracted 12 models from 15 results
+```
+
+This will pinpoint exactly where the data is lost:
+- ❌ If "No results found" → `run_results.json` is empty or missing
+- ❌ If "0 models from X results" → All results are tests/sources/seeds, not models
+- ❌ If HTTP errors → Artifact API issues
+
+**Files Updated:**
+- `streamlit_freshness_app.py` - Added comprehensive artifact fetch logging
+
+---
+
+## [2.10.3] - December 15, 2025 (earlier)
+
+### Critical Fix: Exclude `dbt run-operation` from Model Execution Analysis 🐛
+
+**Root Cause Found!**
+
+After adding debug logging, we discovered that `dbt run-operation` commands (which run macros, NOT models) were being incorrectly matched by our step filter.
+
+**The Problem:**
+```
+Step: "Invoke dbt with `dbt run-operation stage_external_sources`"
+Pattern: "dbt run" in step_name  ✅ MATCHED (incorrect!)
+```
+
+The pattern `"dbt run"` was matching `"dbt run-operation"`, causing the system to process steps that had ZERO model execution data. This is why 200 runs returned 0 models!
+
+**The Fix:**
+
+Changed the pattern matching logic to use space/backtick after command name:
+
+**Before:**
+```python
+has_run = "dbt run" in step_name  # Matches "dbt run-operation" ❌
+has_build = "dbt build" in step_name
+```
+
+**After:**
+```python
+has_run = "dbt run " in step_name or "dbt run`" in step_name
+has_build = "dbt build " in step_name or "dbt build`" in step_name
+# No need to explicitly exclude "dbt run-operation" - the space/backtick check filters it out!
+```
+
+**Why This Works:**
+- `"dbt run "` (space) matches: `"dbt run --select xyz"` ✅
+- `"dbt run`"` (backtick) matches: `"dbt run`"` ✅  
+- Neither matches: `"dbt run-operation xyz"` ❌ (has a dash, not space/backtick)
+
+**Result:**
+```
+✅ "Invoke dbt with `dbt run`" → MATCHED
+✅ "Invoke dbt with `dbt build --selector xyz`" → MATCHED
+❌ "Invoke dbt with `dbt run-operation xyz`" → EXCLUDED (correct!)
+❌ "Invoke dbt with `dbt compile`" → EXCLUDED
+❌ "Invoke dbt with `dbt test`" → EXCLUDED
+```
+
+**Files Updated:**
+- `streamlit_freshness_app.py` - Pre-SAO Waste Analysis step filtering
+- `log_freshness.py` - General run status analysis step filtering
+- `test_run_steps.py` - Debug script updated to match new logic
+
+**Testing:**
+Run `python3 test_run_steps.py` to verify step matching for run 405847959:
+- Before: 2 matching steps (incorrect - included run-operation)
+- After: 1 matching step (correct - only dbt build)
+
+---
+
+## [2.10.3] - December 15, 2025 (earlier)
+
+### Debug Tools: Added Comprehensive Step Name Diagnostics 🔍
+
+**User Report:**
+After fixing the pagination issue, 200 runs were fetched but still "No model execution data found". This is statistically impossible - something must be wrong with step name matching.
+
+**Debug Enhancements Added:**
+
+1. **Detailed Console Logging**
+   ```python
+   DEBUG Run 405847959: Found 7 total steps:
+     Step 1: Clone git repository
+     Step 2: Create profile from connection
+     Step 3: Invoke dbt deps
+     Step 4: Invoke dbt source freshness
+     Step 5: Invoke dbt build --selector incremental  ✅ MATCHED
+     Step 6: Generation of docs
+     Step 7: Invoke dbt compile  ❌ SKIPPED
+   ```
+
+2. **Processing Summary in UI**
+   - Shows "Runs Fetched" vs "Runs with Model Data"
+   - Highlights when 0 runs have data (very unusual!)
+   - Provides debugging guidance specific to the issue
+
+3. **New Test Script: `test_run_steps.py`**
+   - Inspects a single run to show ALL step names
+   - Shows which steps match and which don't
+   - Explains WHY steps are skipped
+   - Run with: `python3 test_run_steps.py`
+
+4. **Better Error Messages**
+   - Removed confusing/redundant diagnostic text
+   - Consolidated into single Processing Summary
+   - Added specific troubleshooting steps
+
+**How to Debug:**
+
+If you see "0 runs with model data":
+
+1. **Check terminal output** for DEBUG messages showing step names
+2. **Run the test script**: `python3 test_run_steps.py`
+3. **Compare step names** against our matching logic:
+   - Must contain: "invoke dbt"
+   - Must contain: "dbt run" OR "dbt build"
+   - Must NOT contain: "dbt test", "dbt compile", "dbt source", "dbt docs", "dbt deps"
+
+**Example Issue:**
+If your steps are named differently (e.g., "Execute dbt build" instead of "Invoke dbt build"), the pattern won't match and you'll get 0 results.
+
+---
+
+## [2.10.3] - December 15, 2025 (earlier)
+
+### Critical Fix: Pagination Issue Causing Missing Runs 🐛
+
+**Problem Discovered:**
+Using the debug test script, we found that run 405847959 (June 13, 2025) was NOT being found when analyzing June 12-16, even though the API was returning it correctly.
+
+**Root Cause:**
+- Date range June 12-16 had MORE than 100 successful runs
+- The slider "Max Runs per Job" was set to 100 (default)
+- The app only fetched the first 100 runs (newest: June 15-16)
+- Run 405847959 from June 13 was beyond the 100-run limit
+- The pagination logic stopped at the user's limit instead of continuing through all runs in the date range
+
+**Fix:**
+1. **Increased slider maximum** from 200 → 1000 runs
+2. **Changed default** from 100 → 200 runs
+3. **Renamed slider** from "Max Runs per Job" → "Max Runs to Analyze" (clearer)
+4. **Added warning** when limit is reached: "⚠️ Reached the maximum of X runs. There may be more runs in this date range."
+5. **Enhanced debug output** to show both newest and oldest run in first page
+6. **Changed step size** from 10 → 50 for easier slider adjustment
+
+**Result:**
+- ✅ Can now analyze up to 1000 runs (vs 200 before)
+- ✅ Users are warned when they hit the limit
+- ✅ Debug output helps diagnose date range coverage
+- ✅ Run 405847959 and similar "middle of range" runs will now be included
+
+---
+
+## [2.10.3] - December 15, 2025 (earlier)
+
+### Improvements: Pre-SAO Waste Analysis Refinements 🔧
+
+**Changes:**
+
+1. **Removed `dbt test` from Pre-SAO Waste Analysis**
+   - Waste analysis now only processes `dbt run` and `dbt build` steps
+   - Test steps don't produce meaningful waste metrics (no rows affected)
+   - Other tabs (Historical Trends, etc.) still include `dbt test` steps
+
+2. **Added Debug Logging for Date Filtering**
+   - First API page now logs how many runs were returned
+   - Shows first run ID and created_at timestamp for verification
+   - Helps diagnose date filtering issues
+
+3. **Updated Diagnostic Messages**
+   - Removed confusing "Current date: Use a date range that ends today or earlier" suggestion
+   - Clarified that Pre-SAO Waste looks for `dbt run` or `dbt build` (not test)
+
+4. **Added Debug Test Script**
+   - New `test_api_debug.py` script to test API date filtering
+   - Can verify if specific runs (like 405847959) are returned by the API
+   - Helps diagnose API parameter issues
+
+**Result:**
+- More focused waste analysis on actual model execution
+- Better diagnostics for troubleshooting "No runs found" issues
+- Clearer error messages for users
+
+---
+
+## [2.10.2] - December 15, 2025
+
+### Critical Bug Fix: Fixed Step Name Matching for dbt Commands 🔧
+
+**Problem:**
+The Pre-SAO Waste Analysis and Historical Trends tabs were finding 0 runs even though runs existed (like run 405847959 from June 2025). The app would show "No model execution data found" even for runs with clear `dbt build` steps.
+
+**Root Cause:**
+The step name filtering logic was too strict and didn't match the actual dbt Cloud step name format:
+- **Code was looking for**: `"invoke dbt with \`dbt run"`, `"invoke dbt with \`dbt build"`, etc.
+- **Actual step names**: `"Invoke dbt build --selector incremental"`, `"Invoke dbt run --select tag:hourly"`, etc.
+- The actual format doesn't have "with \`" in the step name!
+- Result: No steps matched, so no run data was extracted
+
+**Fixes Applied:**
+
+1. **Streamlit App (`streamlit_freshness_app.py`)**:
+   - Changed from exact string matching to flexible pattern matching
+   - Now checks: `"invoke dbt" in step_name AND ("dbt run" OR "dbt build" OR "dbt test")`
+   - Explicitly excludes: `dbt source`, `dbt compile`, `dbt docs`, `dbt deps`
+   - Handles both formats: "Invoke dbt with \`dbt build\`" and "Invoke dbt build --selector xyz"
+
+2. **Log Freshness (`log_freshness.py`)**:
+   - Updated to use case-insensitive matching
+   - Added explicit exclusions for non-execution steps
+   - Included `dbt test` in relevant steps
+
+3. **Date Filtering**:
+   - Also restored working `created_at__range` parameter from commit `4d60d4d`
+   - Uses JSON array format: `'["{start_iso}","{end_iso}"]'`
+   - Fixed multiple indentation errors
+
+**Result:**
+- ✅ Now correctly identifies dbt run/build/test steps in ANY format
+- ✅ Extracts model execution data from runs like 405847959
+- ✅ Works with custom selectors (`--selector incremental`, `--select tag:hourly`, etc.)
+- ✅ Properly excludes compile/docs/deps steps
+
+**Technical Details:**
+```python
+# OLD (broken - too strict):
+if ("invoke dbt with `dbt run" in step_name or ...):
+
+# NEW (working - flexible):
+if ("invoke dbt" in step_name and 
+    ("dbt run" in step_name or "dbt build" in step_name or "dbt test" in step_name) and
+    "dbt source" not in step_name and "dbt compile" not in step_name ...):
+```
+
+---
+
+## [2.10.1] - December 15, 2025
+
+### Critical Bug Fix: Date Filtering Not Working 📅
+
+The Pre-SAO Waste Analysis was stopping after ~10 runs instead of fetching the full limit (100+).
+
+**Root Cause:**
+- Using `created_at__range` API parameter which is NOT supported by dbt Cloud API
+- The API was ignoring the filter and returning unfiltered results
+
+**Fix - Smart Server+Client Approach:**
+1. **Try server-side filtering first** with `created_at__gte` and `created_at__lte` parameters
+2. **Detect if server filtering works** by checking if first run is within range
+3. **Fall back to optimized client-side** if server returns 400 error
+4. **Smart early exit**: Stops scanning when 50+ consecutive runs are outside date range
+5. **Order by date**: Uses `-created_at` ordering for more efficient range queries
+
+**Fallback Client-Side Filter:**
+- Limits to max 50 pages (5000 runs) to avoid infinite scanning
+- Stops when all remaining runs are older than start date
+- Progress updates show "matching" count vs "total scanned"
+
+### Critical Bug Fix: Step-Based Artifact Fetching for Waste Analysis 🔧
+
+The Pre-SAO Waste Analysis was returning "No model execution data found" because it was:
+- Fetching the default `run_results.json` (which could be from `dbt compile` step)
+- Not using step-based fetching like the Historical Trends tab
+
+**Fixed by:**
+- Now fetches run details with `run_steps` included
+- Identifies `dbt run` and `dbt build` steps specifically
+- Fetches `run_results.json` from those steps only
+- Aggregates results across multiple steps if needed
+- Skips `dbt compile`, `dbt test`, `dbt source freshness` steps
+
+**Also added:**
+- Better "Why might this happen?" diagnostics when no data is found
+- Clear explanations of possible issues (wrong date range, no run/build steps, etc.)
+- Shows run-level errors to help debugging
+
+### Enhanced Pre-SAO Waste Analysis: Freshness Status Summary 📊
+
+Added **pivot table analysis** matching the colleague's Excel analysis format for easy comparison and validation.
+
+#### New: Freshness Status Summary Table
+Matches the exact format of the Excel pivot table analysis:
+
+| Column | Description |
+|--------|-------------|
+| Freshness Status | "No New Data to Process" (0 rows) vs "Processed New Data" (>0 rows) |
+| # Model Executions | Count of model runs in each category |
+| % of Executions | Percentage breakdown |
+| Total Time (s) | Combined execution time in seconds |
+| Time (min) | Converted to minutes |
+| Time (hours) | Converted to hours |
+| WH Hours (÷ threads) | Warehouse hours divided by parallel threads |
+| Credits | Snowflake credits consumed |
+| Est. Cost ($) | Dollar amount based on cost per hour |
+
+**Grand Total row** included for complete picture.
+
+#### New Configuration Options
+- **Number of Threads**: Configure parallel threads (default: 32) for warehouse hour calculations
+- **Credits per Hour**: Snowflake credits per hour for your warehouse size
+
+#### New: Model-Level Freshness Breakdown
+Expandable table showing per-model averages by Freshness Status:
+- AVERAGE of Model Execution Time (s)
+- AVERAGE of # of Records Processed
+
+Pivoted to show both "No New Data to Process" and "Processed New Data" side by side.
+
+#### Key Insight Callout
+Automatic warning showing:
+- Percentage of executions that processed no new data
+- Estimated cost of this waste
+- Clear call-to-action for SAO adoption
+
+**Example Output:**
+```
+⚠️ 88.97% of model executions processed no new data - 
+   this is $X,XXX in potential waste that SAO could eliminate!
+```
+
+---
+
 ## [2.10.0] - December 10, 2025
 
 ### Tab Reorganization 🔄

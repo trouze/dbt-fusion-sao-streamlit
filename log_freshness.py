@@ -87,11 +87,23 @@ class DBTFreshnessLogger:
         relevant_steps = []
         for step in all_steps:
             step_name = step.get('name', '')
+            step_name_lower = step_name.lower()
             step_index = step.get('index')
             
-            # Check if this is a run or build command
-            # Examples: "Invoke dbt with `dbt build ...`" or "Invoke dbt with `dbt run ...`"
-            if 'dbt run' in step_name or 'dbt build' in step_name:
+            # Check if this is a run, build, or test command
+            # Using space/backtick after command name (e.g., "dbt run " or "dbt run`")
+            # This automatically filters out "dbt run-operation" (which has a dash, not a space)
+            has_run = 'dbt run ' in step_name_lower or 'dbt run`' in step_name_lower
+            has_build = 'dbt build ' in step_name_lower or 'dbt build`' in step_name_lower
+            has_test = 'dbt test ' in step_name_lower or 'dbt test`' in step_name_lower
+            is_excluded = ('dbt source' in step_name_lower or 
+                          'dbt compile' in step_name_lower or 
+                          'dbt docs' in step_name_lower or 
+                          'dbt deps' in step_name_lower)
+            
+            is_relevant = (has_run or has_build or has_test) and not is_excluded
+            
+            if is_relevant:
                 relevant_steps.append({
                     'index': step_index,
                     'name': step_name,

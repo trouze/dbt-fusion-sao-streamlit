@@ -222,11 +222,38 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                 params['environment_id'] = environment_id
             
             try:
+                # DEBUG: Log the actual request being made
+                if page_num == 1 and progress_callback:
+                    progress_callback(f"DEBUG: API URL: {url}", 0)
+                    progress_callback(f"DEBUG: created_at__range param: {params.get('created_at__range')}", 0)
+                
                 response = requests.get(url, headers=headers, params=params)
+                
+                # DEBUG: Log the actual URL that was called
+                if page_num == 1 and progress_callback:
+                    progress_callback(f"DEBUG: Actual URL: {response.url}", 0)
+                
                 response.raise_for_status()
                 
                 data = response.json()
                 page_runs = data.get('data', [])
+                
+                # DEBUG: Log first page results
+                if page_num == 1 and progress_callback:
+                    if page_runs:
+                        first_run = page_runs[0]
+                        last_run = page_runs[-1]
+                        progress_callback(f"DEBUG: Got {len(page_runs)} runs", 0)
+                        progress_callback(f"  Newest: Run {first_run.get('id')} created {first_run.get('created_at')}", 0)
+                        progress_callback(f"  Oldest: Run {last_run.get('id')} created {last_run.get('created_at')}", 0)
+                        progress_callback(f"  Expected range: {start_iso} to {end_iso}", 0)
+                        
+                        # Check if dates are in expected range
+                        first_created = first_run.get('created_at', '')
+                        if first_created and (start_iso not in first_created[:10] and end_iso[:10] not in first_created[:10]):
+                            progress_callback(f"⚠️  WARNING: Runs are OUTSIDE expected date range! API filtering may not be working.", 0)
+                    else:
+                        progress_callback(f"DEBUG: API returned 0 runs for date range {start_iso} to {end_iso}", 0)
                 
                 if not page_runs:
                     break  # No more runs in date range
@@ -292,7 +319,8 @@ def get_all_jobs_with_metadata(api_base: str, api_key: str, account_id: str, pro
         params = {
             'limit': limit,
             'offset': offset,
-            'order_by': '-id'
+            'order_by': '-id',
+            'state': 'all'  # Include deleted/archived jobs
         }
         
         try:
@@ -580,12 +608,12 @@ def calculate_summary_stats(results):
                     
                     package_resource_stats.append({
                         'Package': package,
-                        'Resource Type': resource_type,
-                        'Total Count': total,
-                        'With Freshness': with_freshness,
-                        'Without Freshness': total - with_freshness,
-                        '% With Freshness': f'{pct:.1f}%'
-                    })
+            'Resource Type': resource_type,
+            'Total Count': total,
+            'With Freshness': with_freshness,
+            'Without Freshness': total - with_freshness,
+            '% With Freshness': f'{pct:.1f}%'
+        })
     
     summary = {
         'overall': {
@@ -911,14 +939,23 @@ def show_freshness_analysis():
             
             # Handle different source modes
             if source_mode == "Environment (Latest)":
-                # Get all jobs in the environment
+                # Get ACTIVE jobs only in the environment with pagination
                 jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
                 headers = {'Authorization': f'Token {config["api_key"]}'}
-                params = {'environment_id': config['environment_id'], 'limit': 100}
                 
-                jobs_response = requests.get(jobs_url, headers=headers, params=params)
-                jobs_response.raise_for_status()
-                jobs = jobs_response.json().get('data', [])
+                jobs = []
+                offset = 0
+                while True:
+                    params = {'environment_id': config['environment_id'], 'limit': 100, 'offset': offset, 'state': 1}  # Active jobs only
+                    jobs_response = requests.get(jobs_url, headers=headers, params=params)
+                    jobs_response.raise_for_status()
+                    page_jobs = jobs_response.json().get('data', [])
+                    if not page_jobs:
+                        break
+                    jobs.extend(page_jobs)
+                    if len(page_jobs) < 100:
+                        break
+                    offset += 100
                 
                 # Filter by job type
                 jobs = filter_jobs_by_type(jobs, job_types_filter)
@@ -1128,9 +1165,9 @@ def show_freshness_analysis():
                 st.markdown("*Packages are sorted by size (largest first = main project)*")
                 st.dataframe(
                     summary['by_package_resource'],
-                    use_container_width=True,
-                    hide_index=True
-                )
+                use_container_width=True,
+                hide_index=True
+            )
             
             # Detailed results
             st.divider()
@@ -1198,7 +1235,7 @@ def show_freshness_analysis():
                         values='Count',
                         title='Build After Configuration Distribution'
                     )
-                    st.plotly_chart(fig_pie, width='stretch')
+                    st.plotly_chart(fig_pie, use_container_width=True)
             else:
                 st.info("No models have freshness build_after configuration")
             
@@ -1356,7 +1393,8 @@ def process_single_run_lightweight(api_base: str, api_key: str, account_id: str,
     """
     Lightweight version: Only fetches run_results and minimal manifest data for waste analysis.
     
-    Does NOT fetch freshness configs or process sources - much faster!
+    Uses STEP-BASED artifact fetching to ensure we get results from dbt run/build steps,
+    NOT from dbt compile steps (which would show all models as "success" without actual execution).
     
     Args:
         api_base: dbt Cloud API base URL
@@ -1371,20 +1409,126 @@ def process_single_run_lightweight(api_base: str, api_key: str, account_id: str,
     try:
         headers = {'Authorization': f'Token {api_key}'}
         
-        # Fetch run_results.json only
-        run_results_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/run_results.json'
-        response = requests.get(run_results_url, headers=headers)
+        # STEP 1: Get run details with steps to find dbt run/build steps
+        run_details_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/'
+        response = requests.get(run_details_url, headers=headers, params={'include_related': '["run_steps"]'})
         response.raise_for_status()
-        run_results = response.json()
+        run_details = response.json().get('data', {})
+        run_steps = run_details.get('run_steps', [])
         
-        # Fetch minimal manifest data (only nodes for materialization lookup)
+        # STEP 2: Find relevant steps (dbt run or dbt build - NOT test, compile, etc.)
+        # For Pre-SAO Waste Analysis, we only want run/build steps (not test)
+        relevant_step_ids = []
+        
+        # DEBUG: Log all steps we see
+        if len(run_steps) > 0:
+            print(f"DEBUG Run {run_id}: Found {len(run_steps)} total steps:")
+            for step in run_steps:
+                step_name = step.get('name', '')
+                step_index = step.get('index')
+                print(f"  Step {step_index}: {step_name}")
+        
+        for step in run_steps:
+            step_name = step.get('name', '').lower()
+            step_id = step.get('id')
+            step_index = step.get('index')  # Use index for artifact API!
+            # Match common step name patterns for dbt run/build/test commands
+            # Using space after command name (e.g., "dbt run ") filters out "dbt run-operation"
+            is_invoke_dbt = "invoke dbt" in step_name
+            has_run = "dbt run " in step_name or "dbt run`" in step_name
+            has_build = "dbt build " in step_name or "dbt build`" in step_name
+            has_test = "dbt test " in step_name or "dbt test`" in step_name
+            is_excluded = ("dbt source" in step_name or "dbt compile" in step_name or 
+                          "dbt docs" in step_name or "dbt deps" in step_name)
+            
+            # For Pre-SAO Waste, exclude test commands (we only want run/build)
+            if is_invoke_dbt and (has_run or has_build) and not is_excluded:
+                relevant_step_ids.append(step_index)  # Store step INDEX, not ID!
+                print(f"  ✅ MATCHED: {step_name} (step index {step_index})")
+            elif is_invoke_dbt:
+                print(f"  ❌ SKIPPED: {step_name}")
+        
+        if not relevant_step_ids:
+            # No dbt run/build steps found - this job might only have compile steps
+            print(f"⚠️ Run {run_id}: No relevant steps found!")
+            return {
+                'run_id': run_id, 
+                'success': True, 
+                'models': [],
+                'job_id': job_id,
+                'job_name': job_name,
+                'run_status': run_status,
+                'note': 'No dbt run/build steps found in this run'
+            }
+        else:
+            print(f"✅ Run {run_id}: Found {len(relevant_step_ids)} relevant step(s)")
+        
+        # STEP 3: Fetch run_results.json from each relevant step and aggregate
+        all_results = []
+        seen_unique_ids = set()
+        
+        for step_index in relevant_step_ids:  # Note: variable name is step_ids but contains indices
+            run_results_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/run_results.json'
+            params = {'step': step_index}
+            
+            try:
+                print(f"  📥 Fetching run_results.json for step index {step_index}...")
+                response = requests.get(run_results_url, headers=headers, params=params)
+                response.raise_for_status()
+                step_results = response.json()
+                
+                results_count = len(step_results.get('results', []))
+                print(f"  ✅ Got {results_count} results from step index {step_index}")
+                
+                for result in step_results.get('results', []):
+                    unique_id = result.get('unique_id')
+                    if unique_id and unique_id not in seen_unique_ids:
+                        all_results.append(result)
+                        seen_unique_ids.add(unique_id)
+                
+                print(f"  📊 Total unique results so far: {len(all_results)}")
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    print(f"  ⚠️  No run_results.json found for step index {step_index} (404)")
+                    continue
+                print(f"  ❌ HTTP Error fetching step index {step_index}: {e}")
+                raise
+            except Exception as e:
+                print(f"  ❌ Unexpected error fetching step index {step_index}: {e}")
+                raise
+        
+        if not all_results:
+            print(f"⚠️ Run {run_id}: No results found in run_results.json from any step!")
+            return {
+                'run_id': run_id, 
+                'success': True, 
+                'models': [],
+                'job_id': job_id,
+                'job_name': job_name,
+                'run_status': run_status,
+                'note': 'No run_results found in dbt run/build steps'
+            }
+        
+        print(f"✅ Run {run_id}: Found {len(all_results)} total results, now filtering to models...")
+        
+        # STEP 4: Fetch manifest for materialization lookup
         manifest_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/manifest.json'
         response = requests.get(manifest_url, headers=headers)
         response.raise_for_status()
         manifest = response.json()
         
+        # STEP 5: Process results
         models = []
-        for result in run_results.get('results', []):
+        
+        # Debug: Show what types of results we have
+        result_types = {}
+        for result in all_results:
+            unique_id = result.get('unique_id', 'unknown')
+            result_type = unique_id.split('.')[0] if '.' in unique_id else 'unknown'
+            result_types[result_type] = result_types.get(result_type, 0) + 1
+        print(f"  📊 Result types in run_results.json: {result_types}")
+        
+        for result in all_results:
             unique_id = result.get('unique_id')
             
             # Only process models (not sources, tests, etc.)
@@ -1436,6 +1580,8 @@ def process_single_run_lightweight(api_base: str, api_key: str, account_id: str,
                 'run_status': run_status
             }
             models.append(model_data)
+        
+        print(f"✅ Run {run_id}: Extracted {len(models)} models from {len(all_results)} results")
         
         return {
             'run_id': run_id,
@@ -1584,8 +1730,21 @@ def show_run_status_analysis():
             key="run_sao_only"
         )
     
+    col5, col6 = st.columns(2)
+    
+    with col5:
+        include_deleted_jobs = st.checkbox(
+            "Include Deleted/Archived Jobs",
+            value=False,
+            help="Include runs from jobs that have been deleted or archived. Essential for historical analysis!",
+            key="run_include_deleted"
+        )
+    
     # Performance tip
-    st.info("💡 **Performance Tip**: Runs are processed in parallel (up to 10 at a time) for much faster analysis! Feel free to analyze 20-50 runs.")
+    if include_deleted_jobs:
+        st.info("💡 **Historical Mode**: Fetching runs by date range first, then enriching with job metadata. This captures runs from deleted jobs!")
+    else:
+        st.info("💡 **Performance Tip**: Runs are processed in parallel (up to 10 at a time) for much faster analysis! Feel free to analyze 20-50 runs.")
     
     analyze_button = st.button("📊 Analyze Run Statuses", type="primary", key="run_analyze")
     
@@ -1628,59 +1787,117 @@ def show_run_status_analysis():
         
         # Fetch runs based on job source
         runs = []
+        all_jobs_dict = {}  # For job metadata enrichment
         
         if job_source == "All Jobs in Environment":
-            # Get all jobs in the environment
-            jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
-            headers = {'Authorization': f'Token {config["api_key"]}'}
-            params = {'environment_id': config['environment_id'], 'limit': 100}
             
-            jobs_response = requests.get(jobs_url, headers=headers, params=params)
-            jobs_response.raise_for_status()
-            jobs = jobs_response.json().get('data', [])
-            
-            # Filter by job type
-            jobs = filter_jobs_by_type(jobs, job_types_filter)
-            
-            if not jobs:
-                st.error(f"❌ No jobs found matching job types: {', '.join(job_types_filter)}")
-                progress_bar.empty()
-                status_text.empty()
-                return
-            
-            status_text.text(f"🔄 Found {len(jobs)} jobs. Fetching runs...")
-            
-            # Get runs from all filtered jobs
-            # Fetch more than max_runs initially to ensure we have enough after date filtering
-            fetch_limit = min(200, max_runs * 3)  # Fetch 3x the slider limit or 200, whichever is smaller
-            all_runs = []
-            for idx, job in enumerate(jobs):
-                job_runs = get_job_runs(
+            if include_deleted_jobs:
+                # HISTORICAL MODE: Fetch runs by date first, then enrich with job metadata
+                # This captures runs from deleted/archived jobs!
+                status_text.text(f"🔄 Fetching ALL runs in date range (including deleted jobs)...")
+                
+                def update_progress(msg, count):
+                    status_text.text(msg)
+                
+                runs = get_all_runs_by_date(
                     config['api_base'],
                     config['api_key'],
                     config['account_id'],
-                    str(job['id']),
-                    config.get('environment_id'),
-                    limit=fetch_limit,
-                    status=status_codes
+                    start_datetime,
+                    end_datetime,
+                    environment_id=config.get('environment_id'),
+                    status=status_codes,
+                    limit=max_runs * 3,  # Fetch extra to allow for filtering
+                    progress_callback=update_progress
                 )
-                all_runs.extend(job_runs)
                 
-                # Update progress
-                progress = int((idx + 1) / len(jobs) * 10)
-                progress_bar.progress(progress)
-            
-            # Sort by date (don't limit yet - do that after date filtering)
-            all_runs = sorted(all_runs, key=lambda x: x.get('created_at', ''), reverse=True)
-            runs = all_runs
+                progress_bar.progress(5)
+                
+                # Get all jobs (including deleted ones) for metadata
+                status_text.text(f"🔄 Fetching job metadata (including deleted jobs)...")
+                all_jobs_dict = get_all_jobs_with_metadata(
+                    config['api_base'],
+                    config['api_key'],
+                    config['account_id'],
+                    progress_callback=update_progress
+                )
+                
+                progress_bar.progress(8)
+                
+                # Enrich runs with job metadata
+                for run in runs:
+                    job_def_id = run.get('job_definition_id')
+                    if job_def_id and job_def_id in all_jobs_dict:
+                        job_info = all_jobs_dict[job_def_id]
+                        run['job_name'] = job_info['name']
+                        run['job_is_active'] = job_info['is_active']
+                        run['job_triggers'] = job_info['triggers']
+                    else:
+                        # Job truly deleted and not in API response
+                        run['job_name'] = f"Deleted Job ({job_def_id})"
+                        run['job_is_active'] = False
+                        run['job_triggers'] = {}
+                
+                # Filter by job type if specified
+                if job_types_filter:
+                    filtered_runs = []
+                    for run in runs:
+                        job_type = determine_job_type(run.get('job_triggers', {}))
+                        if job_type in job_types_filter:
+                            filtered_runs.append(run)
+                    
+                    status_text.text(f"✅ Filtered to {len(filtered_runs)} runs matching job types: {', '.join(job_types_filter)}")
+                    runs = filtered_runs
+                
+                progress_bar.progress(10)
+                
+            else:
+                # STANDARD MODE: Fetch active jobs first, then get their runs
+                jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
+                headers = {'Authorization': f'Token {config["api_key"]}'}
+                params = {'environment_id': config['environment_id'], 'limit': 100}
+                
+                jobs_response = requests.get(jobs_url, headers=headers, params=params)
+                jobs_response.raise_for_status()
+                jobs = jobs_response.json().get('data', [])
+                
+                # Filter by job type
+                jobs = filter_jobs_by_type(jobs, job_types_filter)
+                
+                if not jobs:
+                    st.error(f"❌ No active jobs found matching job types: {', '.join(job_types_filter)}. Try enabling 'Include Deleted/Archived Jobs' for historical analysis!")
+                    progress_bar.empty()
+                    status_text.empty()
+                    return
+                
+                status_text.text(f"🔄 Found {len(jobs)} active jobs. Fetching runs...")
+                
+                # Get runs from all filtered jobs
+                fetch_limit = min(200, max_runs * 3)
+                all_runs = []
+                for idx, job in enumerate(jobs):
+                    job_runs = get_job_runs(
+                        config['api_base'],
+                        config['api_key'],
+                        config['account_id'],
+                        str(job['id']),
+                        config.get('environment_id'),
+                        limit=fetch_limit,
+                        status=status_codes
+                    )
+                    all_runs.extend(job_runs)
+                    
+                    progress = int((idx + 1) / len(jobs) * 10)
+                    progress_bar.progress(progress)
+                
+                runs = sorted(all_runs, key=lambda x: x.get('created_at', ''), reverse=True)
             
         else:  # Specific Job ID
-            # Fetch more runs than the slider to account for date filtering
             fetch_limit = min(200, max_runs * 3)
-            runs = get_job_runs(
-                config['api_base'],
-                config['api_key'],
-                config['account_id'],
+        runs = get_job_runs(
+            config['api_base'],
+            config['api_key'],
+            config['account_id'],
                 job_id_input,
                 config.get('environment_id'),
                 limit=fetch_limit,
@@ -1827,7 +2044,7 @@ def show_run_status_analysis():
             **How we detect model status:**  
             We use the **step-based approach** to get accurate status from `run_results.json`:
             
-            1. **Identify relevant steps**: Filter to only `dbt run` and `dbt build` commands
+            1. **Identify relevant steps**: Filter to only `dbt run`, `dbt build`, and `dbt test` commands
             2. **Fetch run_results.json**: Get results from each relevant step
             3. **Aggregate results**: Combine data across all steps for accurate counts
             
@@ -2000,7 +2217,7 @@ def show_run_status_analysis():
         st.subheader("📋 Detailed Run Breakdown")
         
         st.markdown("""
-        **Status values** are extracted from `run_results.json` using a step-based approach that filters to only `dbt run` and `dbt build` commands.
+        **Status values** are extracted from `run_results.json` using a step-based approach that filters to only `dbt run`, `dbt build`, and `dbt test` commands.
         """)
         
         # Create summary by run
@@ -2328,6 +2545,17 @@ def show_cost_analysis():
                 key="cost_run_status2"
             )
     
+    # Include deleted jobs option
+    include_deleted_jobs = st.checkbox(
+        "Include Deleted/Archived Jobs",
+        value=True,  # Default to True for cost analysis - we want to capture all costs
+        help="Include runs from jobs that have been deleted or archived. Essential for accurate historical cost analysis!",
+        key="cost_include_deleted"
+    )
+    
+    if include_deleted_jobs:
+        st.info("💡 **Historical Mode**: Fetching ALL runs by date range. This captures costs from deleted/archived jobs!")
+    
     # Date range for analysis
     st.subheader("📅 Analysis Period")
     
@@ -2418,49 +2646,119 @@ def show_cost_analysis():
         
         # Fetch runs based on job source
         runs = []
+        all_jobs_dict = {}  # For job metadata enrichment
         
         if job_source == "All Jobs in Environment":
-            # Get all jobs in the environment
-            jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
-            headers = {'Authorization': f'Token {config["api_key"]}'}
-            params = {'environment_id': config['environment_id'], 'limit': 100}
             
-            jobs_response = requests.get(jobs_url, headers=headers, params=params)
-            jobs_response.raise_for_status()
-            jobs = jobs_response.json().get('data', [])
-            
-            # Filter by job type
-            jobs = filter_jobs_by_type(jobs, job_types_filter)
-            
-            if not jobs:
-                st.error(f"❌ No jobs found matching job types: {', '.join(job_types_filter)}")
-                progress_bar.empty()
-                status_text.empty()
-                return
-            
-            status_text.text(f"🔄 Found {len(jobs)} jobs. Fetching runs...")
-            
-            # Get runs from all filtered jobs
-            all_runs = []
-            for idx, job in enumerate(jobs):
-                job_runs = get_job_runs(
+            if include_deleted_jobs:
+                # HISTORICAL MODE: Fetch ALL runs by date first (includes deleted/archived jobs)
+                status_text.text(f"🔄 Fetching ALL runs from {start_date} to {end_date} (including deleted jobs)...")
+                
+                def update_progress(msg, count):
+                    status_text.text(f"🔄 {msg}")
+                
+                runs = get_all_runs_by_date(
                     config['api_base'],
                     config['api_key'],
                     config['account_id'],
-                    str(job['id']),
-                    config.get('environment_id'),
-                    limit=max_runs,
-                    status=status_codes
+                    start_datetime,
+                    end_datetime,
+                    environment_id=config.get('environment_id'),
+                    status=status_codes,
+                    limit=max_runs * 3,  # Fetch extra to allow for filtering
+                    progress_callback=update_progress
                 )
-                all_runs.extend(job_runs)
                 
-                # Update progress
-                progress = int((idx + 1) / len(jobs) * 10)
-                progress_bar.progress(progress)
-            
-            # Sort by date and limit
-            all_runs = sorted(all_runs, key=lambda x: x.get('created_at', ''), reverse=True)[:max_runs]
-            runs = all_runs
+                progress_bar.progress(5)
+                
+                # Get all jobs (including deleted ones) for metadata
+                status_text.text(f"🔄 Fetching job metadata (including deleted jobs)...")
+                all_jobs_dict = get_all_jobs_with_metadata(
+                    config['api_base'],
+                    config['api_key'],
+                    config['account_id'],
+                    progress_callback=update_progress
+                )
+                
+                progress_bar.progress(8)
+                
+                # Enrich runs with job metadata
+                for run in runs:
+                    job_def_id = run.get('job_definition_id')
+                    if job_def_id and job_def_id in all_jobs_dict:
+                        job_info = all_jobs_dict[job_def_id]
+                        run['job_name'] = job_info['name']
+                        run['job_is_active'] = job_info['is_active']
+                        run['job_triggers'] = job_info['triggers']
+                    else:
+                        run['job_name'] = f'Job {job_def_id} (Deleted)'
+                        run['job_is_active'] = False
+                        run['job_triggers'] = {}
+                
+                # Filter by job type if specified
+                if job_types_filter:
+                    filtered_runs = []
+                    for run in runs:
+                        job_type = determine_job_type(run.get('job_triggers', {}))
+                        if job_type in job_types_filter:
+                            filtered_runs.append(run)
+                    
+                    status_text.text(f"✅ Filtered to {len(filtered_runs)} runs matching job types: {', '.join(job_types_filter)}")
+                    runs = filtered_runs
+                
+                progress_bar.progress(10)
+                
+            else:
+                # STANDARD MODE: Fetch active jobs first, then get their runs
+                jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
+                headers = {'Authorization': f'Token {config["api_key"]}'}
+                
+                # Paginate through all active jobs
+                jobs = []
+                offset = 0
+                while True:
+                    params = {'environment_id': config['environment_id'], 'limit': 100, 'offset': offset}
+                    jobs_response = requests.get(jobs_url, headers=headers, params=params)
+                    jobs_response.raise_for_status()
+                    page_jobs = jobs_response.json().get('data', [])
+                    if not page_jobs:
+                        break
+                    jobs.extend(page_jobs)
+                    if len(page_jobs) < 100:
+                        break
+                    offset += 100
+                
+                # Filter by job type
+                jobs = filter_jobs_by_type(jobs, job_types_filter)
+                
+                if not jobs:
+                    st.error(f"❌ No active jobs found matching job types: {', '.join(job_types_filter)}. Try enabling 'Include Deleted/Archived Jobs' for historical analysis!")
+                    progress_bar.empty()
+                    status_text.empty()
+                    return
+                
+                status_text.text(f"🔄 Found {len(jobs)} active jobs. Fetching runs...")
+                
+                # Get runs from all filtered jobs
+                all_runs = []
+                for idx, job in enumerate(jobs):
+                    job_runs = get_job_runs(
+                        config['api_base'],
+                        config['api_key'],
+                        config['account_id'],
+                        str(job['id']),
+                        config.get('environment_id'),
+                        limit=max_runs,
+                        status=status_codes
+                    )
+                    all_runs.extend(job_runs)
+                    
+                    progress = int((idx + 1) / len(jobs) * 10)
+                    progress_bar.progress(progress)
+                
+                # Sort by date and limit
+                all_runs = sorted(all_runs, key=lambda x: x.get('created_at', ''), reverse=True)[:max_runs]
+                runs = all_runs
             
         else:  # Specific Job ID
             runs = get_job_runs(
@@ -2937,6 +3235,28 @@ def show_pre_sao_waste_analysis():
             key="waste_threshold"
         )
     
+    col4, col5 = st.columns(2)
+    
+    with col4:
+        num_threads = st.number_input(
+            "Number of Threads",
+            min_value=1,
+            value=16,
+            step=1,
+            help="Number of parallel threads your warehouse uses (for calculating warehouse hours). Snowflake default is typically 8-16.",
+            key="waste_threads"
+        )
+    
+    with col5:
+        credits_per_hour = st.number_input(
+            "Credits per Hour",
+            min_value=0.0,
+            value=2.0,
+            step=0.1,
+            help="Snowflake credits consumed per hour for your warehouse size",
+            key="waste_credits"
+        )
+    
     # Job selection
     st.subheader("📋 Analysis Scope")
     
@@ -2963,6 +3283,17 @@ def show_pre_sao_waste_analysis():
                 key="waste_job_types"
             )
     
+    # Additional options
+    include_deleted_jobs = st.checkbox(
+        "Include Deleted/Archived Jobs",
+        value=True,  # Default to True for waste analysis since we often look at historical data
+        help="Include runs from jobs that have been deleted or archived. Essential for historical analysis!",
+        key="waste_include_deleted"
+    )
+    
+    if include_deleted_jobs:
+        st.info("💡 **Historical Mode**: Fetching runs by date range first. This captures runs from deleted/archived jobs!")
+    
     # Date range
     st.subheader("📅 Analysis Period")
     
@@ -2987,12 +3318,12 @@ def show_pre_sao_waste_analysis():
     
     with col3:
         max_runs = st.slider(
-            "Max Runs per Job",
+            "Max Runs to Analyze",
             min_value=10,
-            max_value=200,
-            value=100,
-            step=10,
-            help="Maximum runs to fetch per job (higher = more data but slower)",
+            max_value=1000,
+            value=200,
+            step=50,
+            help="Maximum total runs to fetch in the date range. Increase if you have many high-frequency jobs. Higher values = more data but slower.",
             key="waste_max_runs"
         )
     
@@ -3046,59 +3377,130 @@ def show_pre_sao_waste_analysis():
             status_text.text(f"🔄 {msg}")
         
         if job_source == "All Jobs in Environment":
-            # Fetch ALL runs in the date range (includes historical/deleted jobs)
-            update_progress(f"Fetching all runs from {start_date} to {end_date}...", 0)
             
-            runs = get_all_runs_by_date(
-                config['api_base'],
-                config['api_key'],
-                config['account_id'],
-                start_datetime,
-                end_datetime,
-                environment_id=config.get('environment_id'),
-                status=[10],  # Success only for waste analysis
-                limit=max_runs,  # Use slider value directly - all runs have waste data
-                progress_callback=update_progress
-            )
+            if include_deleted_jobs:
+                # HISTORICAL MODE: Fetch ALL runs in the date range (includes historical/deleted jobs)
+                update_progress(f"Fetching ALL runs from {start_date} to {end_date} (including deleted jobs)...", 0)
+                
+                runs = get_all_runs_by_date(
+                    config['api_base'],
+                    config['api_key'],
+                    config['account_id'],
+                    start_datetime,
+                    end_datetime,
+                    environment_id=config.get('environment_id'),
+                    status=[10],  # Success only for waste analysis
+                    limit=max_runs,  # Use slider value directly - all runs have waste data
+                    progress_callback=update_progress
+                )
+                
+                status_text.text(f"✅ Found {len(runs)} successful runs in date range")
+                
+                # Warn if we hit the limit - there might be more runs beyond this
+                if len(runs) >= max_runs:
+                    st.warning(f"⚠️ Reached the maximum of {max_runs} runs. There may be more runs in this date range. Increase the 'Max Runs to Analyze' slider if needed.")
+                
+                progress_bar.progress(10)
+                
+                # Get all jobs (including inactive/deleted ones)
+                all_jobs_dict = get_all_jobs_with_metadata(
+                    config['api_base'],
+                    config['api_key'],
+                    config['account_id'],
+                    progress_callback=update_progress
+                )
+                
+                status_text.text(f"✅ Found {len(all_jobs_dict)} total jobs (active + inactive)")
+                progress_bar.progress(15)
+                
+                # Enrich runs with job metadata
+                for run in runs:
+                    job_def_id = run.get('job_definition_id')
+                    if job_def_id and job_def_id in all_jobs_dict:
+                        job_info = all_jobs_dict[job_def_id]
+                        run['job_name'] = job_info['name']
+                        run['job_is_active'] = job_info['is_active']
+                        run['job_triggers'] = job_info['triggers']
+                    else:
+                        # Job not found (might be deleted and not in API response)
+                        run['job_name'] = f'Job {job_def_id} (Deleted)'
+                        run['job_is_active'] = False
+                        run['job_triggers'] = {}
+                
+                # Filter by job type if specified
+                if job_types_filter:
+                    filtered_runs = []
+                    for run in runs:
+                        job_type = determine_job_type(run.get('job_triggers', {}))
+                        if job_type in job_types_filter:
+                            filtered_runs.append(run)
+                    
+                    status_text.text(f"✅ Filtered to {len(filtered_runs)} runs matching job types: {', '.join(job_types_filter)}")
+                    runs = filtered_runs
             
-            status_text.text(f"✅ Found {len(runs)} successful runs in date range")
-            progress_bar.progress(10)
-            
-            # Get all jobs (including inactive/deleted ones)
-            all_jobs_dict = get_all_jobs_with_metadata(
-                config['api_base'],
-                config['api_key'],
-                config['account_id'],
-                progress_callback=update_progress
-            )
-            
-            status_text.text(f"✅ Found {len(all_jobs_dict)} total jobs (active + inactive)")
-            progress_bar.progress(15)
-            
-            # Enrich runs with job metadata
-            for run in runs:
-                job_def_id = run.get('job_definition_id')
-                if job_def_id and job_def_id in all_jobs_dict:
-                    job_info = all_jobs_dict[job_def_id]
-                    run['job_name'] = job_info['name']
-                    run['job_is_active'] = job_info['is_active']
-                    run['job_triggers'] = job_info['triggers']
-                else:
-                    # Job not found (might be deleted and not in API response)
-                    run['job_name'] = f'Job {job_def_id} (Deleted)'
-                    run['job_is_active'] = False
-                    run['job_triggers'] = {}
-            
-            # Filter by job type if specified
-            if job_types_filter:
+            else:
+                # STANDARD MODE: Fetch active jobs first, then get their runs
+                update_progress(f"Fetching active jobs in environment...", 0)
+                
+                jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
+                headers = {'Authorization': f'Token {config["api_key"]}'}
+                params = {'environment_id': config['environment_id'], 'limit': 100}
+                
+                jobs_response = requests.get(jobs_url, headers=headers, params=params)
+                jobs_response.raise_for_status()
+                jobs = jobs_response.json().get('data', [])
+                
+                # Filter by job type
+                if job_types_filter:
+                    jobs = filter_jobs_by_type(jobs, job_types_filter)
+                
+                if not jobs:
+                    st.error(f"❌ No active jobs found matching job types: {', '.join(job_types_filter)}. Try enabling 'Include Deleted/Archived Jobs' for historical analysis!")
+                    progress_bar.empty()
+                    status_text.empty()
+                    return
+                
+                status_text.text(f"🔄 Found {len(jobs)} active jobs. Fetching runs...")
+                progress_bar.progress(10)
+                
+                # Get runs from all filtered jobs
+                runs = []
+                for idx, job in enumerate(jobs):
+                    job_runs = get_job_runs(
+                        config['api_base'],
+                        config['api_key'],
+                        config['account_id'],
+                        str(job['id']),
+                        config.get('environment_id'),
+                        limit=max_runs,
+                        status=[10]  # Success only
+                    )
+                    # Enrich with job info
+                    for run in job_runs:
+                        run['job_name'] = job.get('name', 'Unknown')
+                        run['job_is_active'] = True
+                        run['job_triggers'] = job.get('triggers', {})
+                    runs.extend(job_runs)
+                    
+                    progress = 10 + int((idx + 1) / len(jobs) * 5)
+                    progress_bar.progress(progress)
+                
+                # Filter by date
                 filtered_runs = []
                 for run in runs:
-                    job_type = determine_job_type(run.get('job_triggers', {}))
-                    if job_type in job_types_filter:
-                        filtered_runs.append(run)
+                    created_at_str = run.get('created_at')
+                    if created_at_str:
+                        try:
+                            created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                            created_at = created_at.replace(tzinfo=None)
+                            if start_datetime <= created_at <= end_datetime:
+                                filtered_runs.append(run)
+                        except:
+                            pass
                 
-                status_text.text(f"✅ Filtered to {len(filtered_runs)} runs matching job types: {', '.join(job_types_filter)}")
                 runs = filtered_runs
+                status_text.text(f"✅ Found {len(runs)} runs in date range")
+                progress_bar.progress(15)
         else:
             # Specific job ID mode
             runs = get_job_runs(
@@ -3262,8 +3664,33 @@ def show_pre_sao_waste_analysis():
         progress_bar.empty()
         status_text.empty()
         
+        # Show processing summary
+        runs_with_data = len(set(model['run_id'] for model in all_model_data)) if all_model_data else 0
+        
+        with st.expander("📊 Processing Summary", expanded=(df.empty)):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Runs Fetched", len(runs))
+            with col2:
+                st.metric("Runs with Model Data", runs_with_data)
+            with col3:
+                st.metric("Models Found", len(df) if not df.empty else 0)
+            
+            if runs_with_data == 0 and len(runs) > 0:
+                st.warning("⚠️ **None of the runs had model execution data!**")
+                st.markdown("""
+                This is highly unusual and suggests:
+                - The runs don't have `dbt run` or `dbt build` command steps
+                - Step names don't match our pattern (check terminal output for step names)
+                - All runs only had `dbt compile`, `dbt test`, or `dbt source freshness` steps
+                
+                **To debug:**
+                1. Check your terminal/console for DEBUG output showing actual step names
+                2. Pick one run ID from your date range and verify it in dbt Cloud UI
+                3. Look for steps like "Invoke dbt build" or "Invoke dbt with \`dbt run\`"
+                """)
+        
         if df.empty:
-            st.warning("No model execution data found")
             return
         
         # Process the data for waste analysis
@@ -3311,6 +3738,126 @@ def show_pre_sao_waste_analysis():
         # Calculate execution cost
         df['execution_time_hours'] = df['execution_time'] / 3600
         df['cost'] = df['execution_time_hours'] * cost_per_hour
+        
+        # ============================================================
+        # FRESHNESS STATUS SUMMARY (Matching Colleague's Pivot Table)
+        # ============================================================
+        st.divider()
+        st.subheader("📊 Freshness Status Summary")
+        st.caption("This matches the pivot table analysis format: 'No New Data to Process' (0 rows) vs 'Processed New Data' (>0 rows)")
+        
+        # Exclude views for this analysis (they don't have meaningful row counts)
+        analysis_df = df[df['materialization'] != 'view'].copy()
+        
+        # Classify by Freshness Status (based on rows_affected)
+        analysis_df['rows_affected_clean'] = analysis_df['rows_affected'].fillna(0).astype(float)
+        analysis_df['Freshness Status'] = analysis_df['rows_affected_clean'].apply(
+            lambda x: 'No New Data to Process' if x == 0 else 'Processed New Data'
+        )
+        
+        # Create summary pivot table
+        summary = analysis_df.groupby('Freshness Status').agg({
+            'unique_id': 'count',  # Number of model executions
+            'execution_time': 'sum',  # Total execution time (seconds)
+            'rows_affected_clean': 'sum'  # Total rows processed
+        }).reset_index()
+        
+        summary.columns = ['Freshness Status', 'Number of Model Executions', 'Total Execution Time (s)', 'Total Rows Processed']
+        
+        # Add percentage
+        total_executions = summary['Number of Model Executions'].sum()
+        summary['Percent of Executions'] = (summary['Number of Model Executions'] / total_executions * 100).round(2)
+        
+        # Add time calculations
+        summary['Sum in Minutes'] = (summary['Total Execution Time (s)'] / 60).round(2)
+        summary['Execution Time Hours'] = (summary['Total Execution Time (s)'] / 3600).round(4)
+        summary['Warehouse Hours (÷ threads)'] = (summary['Execution Time Hours'] / num_threads).round(4)
+        summary['Credits Used'] = (summary['Warehouse Hours (÷ threads)'] * credits_per_hour).round(2)
+        summary['Estimated Cost'] = (summary['Warehouse Hours (÷ threads)'] * cost_per_hour).round(2)
+        
+        # Reorder columns to match colleague's format
+        summary = summary[[
+            'Freshness Status',
+            'Number of Model Executions',
+            'Percent of Executions',
+            'Total Execution Time (s)',
+            'Sum in Minutes',
+            'Execution Time Hours',
+            'Warehouse Hours (÷ threads)',
+            'Credits Used',
+            'Estimated Cost'
+        ]]
+        
+        # Add Grand Total row
+        grand_total = pd.DataFrame([{
+            'Freshness Status': 'Grand Total',
+            'Number of Model Executions': summary['Number of Model Executions'].sum(),
+            'Percent of Executions': 100.0,
+            'Total Execution Time (s)': summary['Total Execution Time (s)'].sum(),
+            'Sum in Minutes': summary['Sum in Minutes'].sum(),
+            'Execution Time Hours': summary['Execution Time Hours'].sum(),
+            'Warehouse Hours (÷ threads)': summary['Warehouse Hours (÷ threads)'].sum(),
+            'Credits Used': summary['Credits Used'].sum(),
+            'Estimated Cost': summary['Estimated Cost'].sum()
+        }])
+        
+        summary_with_total = pd.concat([summary, grand_total], ignore_index=True)
+        
+        # Display the pivot table
+        st.dataframe(
+            summary_with_total,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'Freshness Status': st.column_config.TextColumn('Freshness Status', width='medium'),
+                'Number of Model Executions': st.column_config.NumberColumn('# Model Executions', format='%d'),
+                'Percent of Executions': st.column_config.NumberColumn('% of Executions', format='%.2f%%'),
+                'Total Execution Time (s)': st.column_config.NumberColumn('Total Time (s)', format='%.2f'),
+                'Sum in Minutes': st.column_config.NumberColumn('Time (min)', format='%.2f'),
+                'Execution Time Hours': st.column_config.NumberColumn('Time (hours)', format='%.4f'),
+                'Warehouse Hours (÷ threads)': st.column_config.NumberColumn(f'WH Hours (÷{num_threads})', format='%.4f'),
+                'Credits Used': st.column_config.NumberColumn('Credits', format='%.2f'),
+                'Estimated Cost': st.column_config.NumberColumn('Est. Cost ($)', format='$%.2f')
+            }
+        )
+        
+        # Key insight callout
+        no_data_row = summary[summary['Freshness Status'] == 'No New Data to Process']
+        if not no_data_row.empty:
+            no_data_pct = no_data_row['Percent of Executions'].values[0]
+            no_data_cost = no_data_row['Estimated Cost'].values[0]
+            st.warning(f"⚠️ **{no_data_pct:.1f}%** of model executions processed **no new data** - this is ${no_data_cost:,.2f} in potential waste that SAO could eliminate!")
+        
+        # ============================================================
+        # MODEL-LEVEL FRESHNESS BREAKDOWN
+        # ============================================================
+        with st.expander("📋 Model-Level Freshness Breakdown", expanded=False):
+            st.caption("Average execution time and rows processed per model, grouped by Freshness Status")
+            
+            # Create model-level summary
+            model_summary = analysis_df.groupby(['unique_id', 'Freshness Status']).agg({
+                'execution_time': 'mean',
+                'rows_affected_clean': 'mean'
+            }).reset_index()
+            
+            model_summary.columns = ['Model', 'Freshness Status', 'AVERAGE of Model Execution Time (s)', 'AVERAGE of # of Records Processed']
+            
+            # Extract model name from unique_id
+            model_summary['Model'] = model_summary['Model'].apply(lambda x: x.split('.')[-1] if '.' in str(x) else x)
+            
+            # Pivot to show both statuses side by side
+            model_pivot = model_summary.pivot_table(
+                index='Model',
+                columns='Freshness Status',
+                values=['AVERAGE of Model Execution Time (s)', 'AVERAGE of # of Records Processed'],
+                aggfunc='first'
+            ).round(2)
+            
+            # Flatten column names
+            model_pivot.columns = [f'{val} - {status}' for val, status in model_pivot.columns]
+            model_pivot = model_pivot.reset_index()
+            
+            st.dataframe(model_pivot, use_container_width=True, height=400)
         
         # Categorize waste
         df['waste_category'] = 'Not Waste'
@@ -3721,11 +4268,21 @@ def show_job_overlap_analysis():
             with st.spinner("🔄 Fetching jobs and analyzing SAO..."):
                 jobs_url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
                 headers = {'Authorization': f'Token {config["api_key"]}'}
-                params = {'limit': 100, 'environment_id': env_id}
                 
-                jobs_response = requests.get(jobs_url, headers=headers, params=params)
-                jobs_response.raise_for_status()
-                jobs = jobs_response.json().get('data', [])
+                # Paginate through ACTIVE jobs only (not deleted/archived)
+                jobs = []
+                offset = 0
+                while True:
+                    params = {'limit': 100, 'environment_id': env_id, 'state': 1, 'offset': offset}  # state=1 for active jobs only
+                    jobs_response = requests.get(jobs_url, headers=headers, params=params)
+                    jobs_response.raise_for_status()
+                    page_jobs = jobs_response.json().get('data', [])
+                    if not page_jobs:
+                        break
+                    jobs.extend(page_jobs)
+                    if len(page_jobs) < 100:
+                        break
+                    offset += 100
                 
                 if jobs:
                     # Count SAO jobs
@@ -3816,12 +4373,15 @@ def show_job_overlap_analysis():
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Fetch all jobs
-        status_text.text("🔄 Fetching jobs...")
+        # Fetch all ACTIVE jobs only (not deleted/archived)
+        status_text.text("🔄 Fetching active jobs...")
         url = f'{config["api_base"]}/api/v2/accounts/{config["account_id"]}/jobs/'
         headers = {'Authorization': f'Token {config["api_key"]}'}
         
-        params = {'limit': 100}
+        params = {
+            'limit': 100,
+            'state': 1  # Only active jobs (state=1), not deleted (state=2)
+        }
         if environment_id_input:
             params['environment_id'] = environment_id_input
         
@@ -3910,13 +4470,13 @@ def show_job_overlap_analysis():
                 run_data = run_details_response.json().get('data', {})
                 run_steps = run_data.get('run_steps', [])
                 
-                # Filter to only 'dbt run' and 'dbt build' commands
+                # Filter to only 'dbt run', 'dbt build', and 'dbt test' commands
                 relevant_steps = []
                 for step in run_steps:
                     step_name = step.get('name', '')
                     step_index = step.get('index')
                     
-                    if 'dbt run' in step_name or 'dbt build' in step_name:
+                    if 'dbt run' in step_name or 'dbt build' in step_name or 'dbt test' in step_name:
                         relevant_steps.append(step_index)
                 
                 # Collect models from all relevant steps
