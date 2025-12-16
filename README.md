@@ -1,4 +1,4 @@
-# 🔍 dbt Freshness & Run Status Analyzer
+# 🔍 dbt Fusion SAO Analyzer
 
 A Streamlit web application for analyzing dbt Cloud environments to **optimize compute costs**, **identify waste**, and **maximize the value of State-Aware Orchestration (SAO)**.
 
