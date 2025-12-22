@@ -1,5 +1,499 @@
 # Changelog
 
+## [2.11.4] - December 19, 2025
+
+### 📈 NEW FEATURE: Models Built Over Time Chart
+
+**What's New:**
+- Added new time-series stacked bar chart showing "Models Built: Wasted vs Not Wasted Over Time"
+- Similar to dbt Cloud's "All model builds" visualization
+- Automatically chooses hourly bucketing for < 2 days, daily otherwise
+- Shows green (Not Wasted) and red (Wasted) stacks for easy visualization
+- Includes summary metrics: Total Executions, Wasted count/%, Not Wasted count/%
+
+**Why This Helps:**
+- Visualize waste trends over time, not just aggregates
+- Identify patterns (e.g., "every morning at 8am we have waste")
+- Compare to dbt Cloud's reuse chart to quantify SAO ROI
+- See if waste is increasing or decreasing over your analysis period
+
+**Location:** Pre-SAO Waste Analysis → Source Freshness Waste section → After Pure Waste Model Details
+
+---
+
+### 🔍 Enhanced Debug Logging for Classification
+
+**What's New:**
+- Added detailed terminal logging when processing runs to help debug classification issues
+- Shows source freshness status, age (in days), and staleness determination for each source
+- Displays classification breakdown after linking models to sources
+- Helps troubleshoot why models aren't being classified as waste
+
+**Debug Output Includes:**
+```
+🔍 Analyzing 3 sources with threshold=86400s (24.0h):
+   source.project.schema.table1: status=pass, age=365.2d, stale=True
+   source.project.schema.table2: status=error, age=180.5d, stale=True
+   
+📊 Classification breakdown:
+   - pure_waste: 9
+   - justified: 0
+   - unknown: 0
+```
+
+**How to Use:**
+- Run your Streamlit app from terminal (not via Streamlit Cloud)
+- Watch the terminal output as runs are processed
+- Look for "🔍 Analyzing X sources..." to see source freshness evaluation
+
+---
+
+### 🐛 Critical Bugfix: Source Freshness Classification Logic
+
+**Problem:**
+- Models were not being classified as "pure waste" even when source freshness checks were failing
+- The classification logic ONLY considered sources with `status == 'pass'`, ignoring `'warn'` and `'error'` statuses
+- When dbt freshness checks fail (`warn`/`error`), it means the source IS stale, but we were marking these as "justified"
+- Result: Empty charts and "no waste detected" messages despite having stale sources
+
+**Root Cause:**
+```python
+# OLD - Only checked pass + custom threshold
+elif all(s['freshness']['status'] == 'pass' and 
+         s['freshness']['max_loaded_at_time_ago_in_s'] > staleness_threshold_seconds
+         for s in sources_with_data):
+    model['source_freshness_classification'] = 'pure_waste'
+```
+
+**Fix:**
+```python
+# NEW - Also considers warn/error statuses
+elif all(
+    (s['freshness']['status'] in ['error', 'warn']) or  # dbt check failed = stale
+    (s['freshness']['status'] == 'pass' and             # passed but still stale
+     s['freshness']['max_loaded_at_time_ago_in_s'] > staleness_threshold_seconds)
+    for s in sources_with_data
+):
+    model['source_freshness_classification'] = 'pure_waste'
+```
+
+**Impact:**
+- ✅ Models with failing freshness checks now correctly classified as pure waste
+- ✅ Charts and tables now populate with waste data
+- ✅ Accurate ROI calculations for SAO adoption
+- ✅ Cascading waste detection now works for all stale sources
+
+**What Changed:**
+- Updated `link_models_to_sources()` function (line 1486-1505)
+- Updated UI text to explicitly define "source freshness failing"
+- Now considers THREE staleness indicators:
+  1. `status == 'error'` (dbt check failed - source too old)
+  2. `status == 'warn'` (dbt check warned - source getting old)
+  3. `status == 'pass'` BUT `max_loaded_at_time_ago_in_s > threshold` (passed dbt check but still stale by custom threshold)
+
+**User Definition (Explicit):**
+"Source freshness failing" means: `'warn'` OR `'error'` OR (`'pass'` AND age > Source Staleness Threshold)
+
+---
+
+### UX Improvement: Collapsible Introduction Section 🎯
+
+**What Changed:**
+- Moved the "Understanding Pre-SAO Waste: Two Complementary Analyses" intro into a collapsible expander
+- Starts collapsed by default (`expanded=False`)
+- Reduces initial visual clutter while keeping info accessible
+
+**Why:**
+- The intro was very long (~30 lines)
+- Users who understand the concept don't need to see it every time
+- New users can expand to learn about the two analyses
+- Cleaner, more focused UI
+
+**How to use:**
+- Click "🎯 Understanding Pre-SAO Waste: Two Complementary Analyses" to expand/collapse
+- Content remains the same, just better organized
+
+---
+
+### UX Improvement: Collapsible Source Freshness Section 📊
+
+**What Changed:**
+- Made "1️⃣ Source Freshness Waste (Primary ROI)" section collapsible with `st.expander`
+- Starts collapsed by default (`expanded=False`)
+- All metrics, charts, and tables remain inside the expandable section
+
+**Why:**
+- Large section with detailed analysis (~200 lines of content)
+- Users can choose to focus on specific analyses
+- Reduces scrolling and visual clutter
+- Matches the pattern of the introduction section
+
+**How to use:**
+- Click "1️⃣ Source Freshness Waste (Primary ROI)" to expand/collapse
+- All classification metrics, charts, and pure waste details are inside
+
+---
+
+### Enhancement: Added `dbt retry` Command Support 🔄
+
+**What Changed:**
+- Added detection for `dbt retry` commands in all step filtering logic
+- `dbt retry` is now treated the same as `dbt run` and `dbt build` for artifact fetching
+- Updated both Pre-SAO Waste Analysis and Job Overlap Analysis
+
+**Locations Updated:**
+1. `process_single_run_lightweight()` - Step filtering for waste analysis
+2. Job Overlap Analysis - Model counting across jobs
+
+**Why This Matters:**
+- `dbt retry` reruns failed models from previous runs
+- It produces the same artifacts (`run_results.json`) as `dbt run`/`dbt build`
+- Without this, retry steps were being skipped in waste analysis
+
+**Console Output:**
+```
+✅ MATCHED: Invoke dbt with `dbt retry` (step index 4)
+```
+
+---
+
+### Bug Fix: Model Builds Over Time Chart 📊
+
+**Issue:** `ValueError: Length mismatch: Expected axis has 2 elements, new values have 3 elements`
+
+**Cause:** The pivot operation creates columns based on `is_waste` values (True/False). If all models were either wasted OR not wasted (no mix), the pivot only had 2 columns instead of 3, causing the hardcoded column rename to fail.
+
+**Fix:**
+- Dynamically detect which columns exist after pivot (False, True, or both)
+- Build column rename list accordingly
+- Ensure both `not_wasted` and `wasted` columns exist (fill with 0 if missing)
+- Added empty dataframe check to prevent errors when no data available
+
+**Impact:** Chart now works correctly regardless of data distribution.
+
+---
+
+### Major Reorganization: Two-Section Waste Analysis 🎯
+
+**Issue:** The "Pre-SAO Waste Analysis" tab mixed two fundamentally different concepts, causing confusion:
+- Source freshness waste (models ran when sources were stale)
+- Row-based waste (models processed zero/few rows)
+
+**Solution: Clear Two-Section Layout**
+
+#### New Structure:
+
+**Introduction** - Explains both types of waste upfront
+```
+1️⃣ Source Freshness Waste (Primary ROI)
+   - Based on sources.json - when did upstream data update?
+   - Includes views (they're unnecessary work)
+   - 100% avoidable with SAO + source freshness
+   - Cascades down the DAG
+
+2️⃣ Row-Based Waste (Secondary ROI)
+   - Based on rows_affected - how much data was processed?
+   - Excludes views (they have $0 compute cost)
+   - Identifies scheduling/incremental optimization opportunities
+   - Useful for finding models that run too frequently
+
+📊 Combined Summary & ROI
+   - Brings both analyses together
+   - Shows overlap between the two
+   - Total annual opportunity calculation
+```
+
+**Benefits:**
+- ✅ Crystal clear distinction between the two analyses
+- ✅ Different metrics and rules make sense
+- ✅ User understands what each section measures
+- ✅ Both ROI stories remain accessible
+- ✅ Combined summary shows total value
+
+**UI Changes:**
+- Added intro markdown explaining both types
+- Section 1 (Source Freshness) moved to top - it's the primary ROI
+- Section 2 (Row-Based) clearly labeled as secondary
+- New Section 3 with combined metrics and total opportunity
+
+---
+
+### Enhancement: Materialization Breakdown Shows Views 📦
+
+**Issue:** Views (staging models) were invisible in source freshness waste analysis because they have $0 cost.
+
+**Why Views Matter:**
+- Views still represent **wasted work** when sources are stale
+- They consume **CI/CD time** and **job orchestration overhead**  
+- SAO would **skip them entirely**, saving time
+- They're typically the **first downstream models** after stale sources
+
+**What's New:**
+1. **Materialization Breakdown Charts** - Shows pure waste by materialization type (view, table, incremental)
+   - Left chart: Model count (shows views!)
+   - Right chart: Cost impact (shows compute cost)
+2. **Enhanced Model Details Table** - Now includes materialization type column
+3. **View Counter** - Info box showing how many staging/view models ran unnecessarily
+
+**Example Output:**
+```
+💡 15 staging/view models ran when sources were stale. While views have $0 compute cost,
+they still represent wasted CI/CD time and orchestration overhead. With SAO, these would be skipped entirely.
+```
+
+---
+
+### Critical Fix: Source Freshness Step Detection 🔍
+
+**Issue:** `sources.json` was not being found because we were looking in the wrong steps
+- Previously: Only checked `dbt run` and `dbt build` steps for sources.json
+- Reality: `sources.json` comes from `dbt source freshness` steps!
+
+**Fix:**
+1. **Find dedicated source freshness steps** - Look for steps with "dbt source freshness" in the name
+2. **Fetch sources.json from those steps first** - Check the dedicated freshness steps
+3. **Fallback to run/build steps** - In case sources.json is bundled with other artifacts
+
+**Console Output (now shows):**
+```
+❌ SKIPPED: invoke dbt with `dbt source freshness` (for run_results)
+🔍 Found source freshness step: Invoke dbt with `dbt source freshness` (index 2)
+✅ Found sources.json in source freshness step 2
+```
+
+**Impact:**
+- Source freshness ROI analysis will now work correctly
+- Models will be properly classified based on actual source freshness data
+- No more "No sources.json found" when freshness steps exist
+
+---
+
+### Major Enhancement: Cascading Waste Detection 🎯
+
+**NEW: Complete DAG-Based Waste Propagation**
+The waste classification now traces through the entire DAG to identify cascading waste, with **only 3 final categories**:
+- 🔴 **Pure Waste** (includes cascaded waste)
+- 🟢 **Justified** (has fresh data)
+- 🟡 **Unknown** (no freshness data)
+
+**How it works:**
+1. **Phase 1**: Classify models with direct source dependencies
+   - If ALL sources stale → pure_waste
+   - If any source fresh → justified
+
+2. **Phase 2**: CASCADE through the DAG
+   - If ALL upstream models are waste → this model is waste
+   - If ANY upstream model is justified → this model is justified
+   - Iteratively propagates through multiple DAG levels
+   - Example: `orders source (stale) → stg_orders → order_items → mart_sales` (all marked as waste)
+
+3. **Phase 3**: Final cleanup (NEW!)
+   - Any models that couldn't be classified (no dependencies or unresolved) → marked as 'unknown'
+   - **No more "Model-Only Dependencies" category** - everything is either waste, justified, or unknown
+
+**Impact:**
+- **100% complete classification** - every model gets a definitive status
+- **Much more accurate waste quantification** - entire wasted lineages identified
+- **Clearer UI** - only 3 categories instead of 4, no ambiguous "model-only deps"
+- If `orders` source is stale, ALL downstream models (10+ models) are correctly marked as waste
+
+This provides the **most accurate** picture of total waste in the pipeline!
+
+---
+
+### Bug Fixes & Improved Messaging 🐛
+
+**Fixed:**
+- KeyError: 'Freshness Status' in Model-Level Breakdown expander
+- Updated all references from 'Freshness Status' → 'Row Change Status' for consistency
+- Streamlit deprecation warnings: Replaced all `use_container_width=True` with `width='stretch'` (26 instances)
+  - `use_container_width` will be removed after December 31, 2025
+- Plotly deprecation warnings: Added explicit `config={}` parameter to all `st.plotly_chart()` calls (15 instances)
+  - Keyword arguments deprecated in favor of config dict
+  - **Note:** You may need to restart the Streamlit app to clear cached warnings
+- Pandas FutureWarning: Changed `dt.floor('H')` to `dt.floor('h')` for hourly time bucketing
+  - Uppercase 'H' deprecated in favor of lowercase 'h'
+- Pandas Downcasting Warning: Fixed `fillna()` calls to avoid implicit downcasting (4 instances)
+  - Used `pd.to_numeric()` with explicit type handling
+  - Used explicit float literals (0.0) instead of implicit conversion
+- **Result: Zero deprecation warnings in console (after restart)!** ✅
+
+**Improved Classification:**
+- Renamed "No Upstream Sources" → "Model-Only Dependencies" 
+- Added clear explanation that models without direct source dependencies CAN still be reused by SAO
+- Separated metrics into 5 distinct columns with emojis for clarity:
+  - 🔴 Pure Waste (stale sources)
+  - 🟢 Justified (sources updated)
+  - 🔵 Model-Only Dependencies (depends on models, not sources directly)
+  - 🟡 Unknown (no freshness data)
+  - 💰 Pure Waste Cost
+- Updated pie chart colors (Model-Only Dependencies now light blue #74c0fc)
+- Added detailed classification logic explanation with reference to dbt Cloud lineage behavior
+
+**Why This Matters:**
+The previous messaging incorrectly suggested models without direct source dependencies were problematic. In reality, these models (e.g., `customers` that depends on `stg_customers`) are perfectly fine and can be efficiently reused by SAO when their upstream models don't change - as shown in dbt Cloud's lineage diagrams.
+
+---
+
+## [2.11.3] - December 19, 2025
+
+### New Feature: Model Builds Over Time Chart 📊
+
+**What's New:**
+Added a stacked bar chart showing model builds over time, split into "Wasted" vs "Not Wasted" executions.
+
+**Smart Time Bucketing:**
+- **Hourly granularity**: Used when analyzing < 2 days of data
+- **Daily granularity**: Used for 2+ days of data
+- Automatically adjusts based on the selected date range
+
+**Visual Design:**
+- Stacked bars for easy comparison
+- Green (#51cf66): Models Built (Not Wasted)
+- Red (#ff6b6b): Models Built (Wasted)
+- Hover tooltips show exact counts
+
+**Summary Metrics:**
+Below the chart, displays:
+- Total Model Builds
+- Not Wasted count (with %)
+- Wasted count (with %)
+- Chart Granularity indicator
+
+**Location:**
+Pre-SAO Waste Analysis tab → Waste Over Time section (after the wasted cost chart)
+
+**Why This Matters:**
+Complements the cost chart by showing volume of wasted executions over time, making it easier to:
+- Spot patterns in when waste occurs
+- Compare waste volume across different time periods
+- Identify specific days/hours with high waste
+
+**Files Updated:**
+- `streamlit_freshness_app.py` - Added ~85 lines for new chart and metrics
+
+---
+
+## [2.11.2] - December 19, 2025
+
+### Enhancement: Configurable Source Staleness Threshold ⚙️
+
+**What Changed:**
+Changed source freshness staleness threshold from hardcoded 1 hour to configurable 24 hours default.
+
+**Why:**
+The 1-hour threshold was too aggressive. In reality, sources that haven't updated in 24+ hours are more indicative of stale data that shouldn't trigger model runs.
+
+**New Feature:**
+- Added "Source Staleness Threshold (hours)" input field in Pre-SAO Waste configuration
+- Default: 24 hours (was 1 hour)
+- User-configurable from 1 hour to any value
+- Applied to source freshness classification: models are "pure waste" only if ALL upstream sources are older than this threshold
+
+**Technical Details:**
+- Updated `link_models_to_sources()` to accept `staleness_threshold_seconds` parameter
+- Updated `process_single_run_lightweight()` to pass threshold through
+- Threshold is converted from hours (UI) to seconds (logic) automatically
+- Classification logic: `max_loaded_at_time_ago_in_s > staleness_threshold_seconds`
+
+**User Interpretation:**
+- `max_loaded_at`: When the source table was last updated
+- `snapshotted_at`: When dbt checked the freshness  
+- `max_loaded_at_time_ago_in_s`: How long ago the source was updated (staleness)
+- If all sources > threshold → Pure waste (shouldn't have run)
+
+**UI Updates:**
+- Shows threshold in section description
+- Displays in info messages when sources.json unavailable
+- Debug logging includes threshold value
+
+**Files Updated:**
+- `streamlit_freshness_app.py` - Added configuration, updated logic and UI text
+
+---
+
+## [2.11.1] - December 19, 2025
+
+### Critical UX Fix: Clarified Row Changes vs Source Freshness 🔍
+
+**The Problem:**
+Users were confused by conflicting messages:
+- Source Freshness section showed 32,786 "Justified Runs" (sources updated)
+- "Freshness Status Summary" section showed 100% with "no new data"
+
+**Root Cause:**
+The sections measured different things but used similar language:
+- **Source Freshness**: Whether upstream sources had new data
+- **Freshness Status**: Whether models produced row changes (rows_affected)
+
+It's possible for sources to update BUT models to produce 0 rows_affected (e.g., incremental models where new source data doesn't match filter conditions).
+
+**The Fix:**
+1. Renamed "Freshness Status Summary" → "Row Changes Analysis"
+2. Changed "No New Data to Process" → "No Rows Changed (0 rows_affected)"
+3. Changed "Processed New Data" → "Rows Changed (>0 rows_affected)"
+4. Added clear caption explaining the difference between the two analyses
+5. Updated warning message to clarify what's being measured
+
+**Impact:**
+Users now understand that:
+- **Source Freshness-Based Waste** = Pure waste (sources unchanged, shouldn't have run)
+- **Row Changes Analysis** = Execution efficiency (models ran but produced no output)
+
+These are complementary metrics, not contradictory!
+
+**Files Updated:**
+- `streamlit_freshness_app.py` - Updated naming and messaging throughout Pre-SAO Waste tab
+
+---
+
+## [2.11.0] - December 19, 2025
+
+### Major Feature: Source Freshness-Based Waste ROI Analysis 🎯
+
+**What's New:**
+
+Added source freshness analysis to Pre-SAO Waste tab to identify **pure waste** - models that ran when ALL upstream sources had no new data. This provides the strongest ROI metric for SAO adoption by showing executions that were 100% avoidable.
+
+**New Capabilities:**
+
+1. **Pure Waste Classification**:
+   - Analyzes `sources.json` artifacts to track source freshness checks
+   - Links models to their upstream source `max_loaded_at` timestamps
+   - Identifies models that ran when all sources were stale (>1hr old)
+
+2. **Enhanced UI Sections**:
+   - **Metrics Dashboard**: Pure waste count, justified runs, unknown status, and pure waste cost
+   - **Pie Chart**: Visual breakdown of waste classification by cost
+   - **Top 20 Pure Waste Models**: Shows models with highest pure waste cost
+   - **ROI Impact**: Clear dollar savings from enabling SAO + source freshness
+
+3. **Smart Detection**:
+   - `pure_waste`: ALL upstream sources unchanged (>1hr old)
+   - `justified`: At least one source recently updated
+   - `unknown`: No source freshness data available
+   - `no_sources`: Model doesn't depend on any sources
+
+**Technical Implementation:**
+
+- New helper function: `fetch_sources_json()` - fetches source freshness artifacts
+- New helper function: `link_models_to_sources()` - links models to source freshness status
+- Enhanced `process_single_run_lightweight()` to fetch and process sources.json
+- Added classification fields to model data: `source_freshness_classification`, `upstream_sources`
+
+**Graceful Degradation:**
+
+If jobs don't run `dbt source freshness`, the feature gracefully degrades with helpful messaging about how to enable it. Existing waste analysis based on row changes continues to work.
+
+**Business Impact:**
+
+Customers can now see exactly which model executions were completely unnecessary (pure waste) vs. justified runs where data actually changed. This strengthens the ROI case for SAO adoption.
+
+**Files Updated:**
+- `streamlit_freshness_app.py` - Added ~300 lines for source freshness analysis
+
+---
+
 ## [2.10.4] - December 15, 2025
 
 ### Improvement: Job State Filtering - Correct by Tab 🎯

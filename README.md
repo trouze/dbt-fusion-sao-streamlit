@@ -12,12 +12,13 @@ A Streamlit web application for analyzing dbt Cloud environments to **optimize c
 Analyzes dbt Cloud job runs, model execution patterns, and freshness configurations to provide actionable insights for cost optimization and performance improvement.
 
 ### Key Capabilities
-- 🗑️ **Pre-SAO Waste Analysis**: Identify $50K+ in annual waste from zero/low-change models
+- 🗑️ **Pre-SAO Waste Analysis**: Identify $50K+ in annual waste from zero/low-change models + source freshness-based "pure waste"
+- 🎯 **Source Freshness ROI**: Track models that ran when upstream sources had no new data (100% avoidable waste)
 - 🔀 **Job Overlap Detection**: Find redundant model executions across jobs
 - 📈 **Historical Trends**: Track reuse rates, performance, and status distribution over time
 - 💰 **Cost Analysis & ROI**: Calculate actual warehouse costs and SAO savings
 - 📋 **Model Configuration**: Audit freshness coverage and identify configuration gaps
-- 🎯 **SAO Adoption**: Monitor State-Aware Orchestration rollout and health
+- 🏆 **SAO Adoption**: Monitor State-Aware Orchestration rollout and health
 
 ### Who It's For
 - **Analytics Engineers**: Optimize dbt job performance and SAO adoption
@@ -88,10 +89,14 @@ One-time setup for your dbt Cloud credentials and default job settings.
 
 **Perfect for**: First-time setup, switching between jobs/environments
 
-### Tab 2: 🗑️ Pre-SAO Waste Analysis (NEW!)
+### Tab 2: 🗑️ Pre-SAO Waste Analysis (ENHANCED!)
 
 **Identify and quantify wasted compute** from models that run but produce minimal/no changes:
-- **Intelligent Waste Detection**: Automatically identifies zero-change and low-change executions
+- **Source Freshness-Based ROI** ⭐ NEW: Identify "pure waste" - models that ran when ALL upstream sources had no new data
+- **Pure Waste Classification**: Automatically detects models that should have been skipped (100% avoidable)
+- **Justified vs. Unnecessary Runs**: See which executions were needed vs. wasted
+- **ROI Impact Metrics**: Calculate exact dollar savings from enabling SAO + source freshness
+- **Intelligent Waste Detection**: Identifies zero-change and low-change executions (row-based analysis)
 - **View Exclusion**: Excludes view models (don't drive warehouse costs)
 - **Configurable Threshold**: Set minimum row count for "meaningful" changes
 - **Cost Quantification**: Calculate exact dollar amount wasted

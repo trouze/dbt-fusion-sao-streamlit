@@ -1387,11 +1387,227 @@ def show_freshness_analysis():
         st.exception(e)
 
 
+def fetch_sources_json(api_base: str, api_key: str, account_id: str, run_id: int, step_index: int = None):
+    """
+    Fetch sources.json artifact from dbt Cloud.
+    This contains actual source freshness check results with max_loaded_at timestamps.
+    
+    Returns None if sources.json doesn't exist (run didn't check freshness).
+    
+    Args:
+        api_base: dbt Cloud API base URL
+        api_key: dbt Cloud API key
+        account_id: dbt Cloud account ID
+        run_id: Run ID
+        step_index: Optional step index to fetch from specific step
+    
+    Returns:
+        dict: sources.json data, or None if not found
+    """
+    url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/sources.json'
+    headers = {'Authorization': f'Token {api_key}'}
+    
+    params = {}
+    if step_index is not None:
+        params['step'] = step_index
+    
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            return None  # sources.json doesn't exist for this run
+        raise
+
+
+def link_models_to_sources(manifest: dict, model_results: list, sources_freshness: dict, staleness_threshold_seconds: int = 86400) -> list:
+    """
+    Link each model to its upstream source freshness status and CASCADE waste classification down the DAG.
+    
+    ⚠️ CRITICAL FIX: Case-insensitive status checks (API returns "Error", not "error")
+    
+    Cascading Logic (3-tier classification):
+    - PURE WASTE: If ALL upstream (sources OR models) are pure waste → 100% avoidable
+    - PARTIAL WASTE: If ANY waste exists in upstream (pure OR partial) → partially avoidable  
+    - JUSTIFIED: If ALL upstream are justified → needed to run
+    - If stg_orders is waste (stale source) → dim_orders is waste → fct_orders is waste
+    - This captures the full impact of stale sources through the entire lineage
+    
+    Args:
+        manifest: manifest.json data
+        model_results: List of model execution results from run_results.json
+        sources_freshness: Parsed sources.json with freshness check results
+        staleness_threshold_seconds: Threshold in seconds for considering sources stale (default: 24 hours)
+        
+    Returns:
+        Enhanced model_results with source_freshness_classification field
+    """
+    # Build source freshness lookup: unique_id -> freshness data
+    source_lookup = {}
+    if sources_freshness:
+        for result in sources_freshness.get('results', []):
+            source_lookup[result['unique_id']] = {
+                'max_loaded_at': result.get('max_loaded_at'),
+                'max_loaded_at_time_ago_in_s': result.get('max_loaded_at_time_ago_in_s'),
+                'status': result.get('status'),  # pass/warn/error (may be capitalized!)
+                'snapshotted_at': result.get('snapshotted_at')
+            }
+    
+    # Build lookup of models that ran in this execution
+    models_in_run = {model['unique_id']: model for model in model_results}
+    
+    # PHASE 1: Classify models with direct source dependencies
+    for model in model_results:
+        unique_id = model['unique_id']
+        
+        # Get model dependencies from manifest
+        node = manifest.get('nodes', {}).get(unique_id, {})
+        depends_on_nodes = node.get('depends_on', {}).get('nodes', [])
+        
+        # Split dependencies: sources vs models
+        source_deps = [dep for dep in depends_on_nodes if dep.startswith('source.')]
+        model_deps = [dep for dep in depends_on_nodes if dep.startswith('model.')]
+        
+        model['upstream_model_deps'] = model_deps  # Store for phase 2
+        
+        # Check if model has direct source dependencies
+        if not source_deps:
+            # No direct sources - will check model dependencies in phase 2
+            model['source_freshness_classification'] = 'no_direct_sources'
+            model['upstream_sources'] = []
+        elif not sources_freshness:
+            # No sources.json available - classify as JUSTIFIED (can't prove waste)
+            # This happens when jobs don't run `dbt source freshness`
+            model['source_freshness_classification'] = 'justified'
+            model['waste_reason'] = 'no_source_freshness_data'
+            model['upstream_sources'] = source_deps
+        else:
+            # Check freshness of upstream sources
+            sources_with_data = []
+            
+            for source_id in source_deps:
+                if source_id in source_lookup:
+                    sources_with_data.append({
+                        'id': source_id,
+                        'freshness': source_lookup[source_id]
+                    })
+            
+            # Classification logic
+            if len(sources_with_data) == 0:
+                # No freshness data for these specific sources (but sources.json exists for the run)
+                # Mark as JUSTIFIED (can't prove waste without data)
+                model['source_freshness_classification'] = 'justified'
+                model['waste_reason'] = 'sources_not_in_freshness_check'
+            elif all(
+                # ⚠️ CRITICAL FIX: Case-insensitive status check
+                # API returns "Error"/"Warn"/"Pass", not lowercase!
+                ((s['freshness'].get('status') or '').lower() in ['error', 'warn']) or
+                ((s['freshness'].get('status') or '').lower() == 'pass' and 
+                 s['freshness']['max_loaded_at_time_ago_in_s'] > staleness_threshold_seconds)
+                for s in sources_with_data
+            ):
+                # ALL sources are stale (unchanged) - PURE WASTE
+                model['source_freshness_classification'] = 'pure_waste'
+                model['waste_reason'] = 'all_direct_sources_stale'
+            else:
+                # At least one source was recently updated - justified
+                model['source_freshness_classification'] = 'justified'
+                model['waste_reason'] = 'some_direct_sources_fresh'
+            
+            model['upstream_sources'] = sources_with_data
+    
+    # PHASE 2: CASCADE waste classification down the DAG
+    # Models without direct sources inherit classification from upstream models
+    max_iterations = 10  # Prevent infinite loops in circular dependencies
+    changed = True
+    iteration = 0
+    
+    while changed and iteration < max_iterations:
+        changed = False
+        iteration += 1
+        
+        for model in model_results:
+            # Only process models that haven't been definitively classified yet
+            current_classification = model.get('source_freshness_classification')
+            if current_classification not in ['no_direct_sources', 'unknown']:
+                continue
+            
+            model_deps = model.get('upstream_model_deps', [])
+            
+            if not model_deps:
+                # No dependencies at all - leave as unknown
+                if current_classification != 'unknown':
+                    model['source_freshness_classification'] = 'unknown'
+                    model['waste_reason'] = 'no_dependencies'
+                    changed = True
+                continue
+            
+            # Check classification of upstream models that ran in this execution
+            upstream_classifications = []
+            for dep_id in model_deps:
+                if dep_id in models_in_run:
+                    dep_class = models_in_run[dep_id].get('source_freshness_classification')
+                    if dep_class and dep_class not in ['no_direct_sources']:  # Only count if classified
+                        upstream_classifications.append(dep_class)
+            
+            if not upstream_classifications:
+                # No upstream models have been classified yet - will try next iteration
+                continue
+            
+            # Cascade logic (3-tier classification):
+            # - If ALL upstream models are pure_waste → pure_waste (100% avoidable)
+            # - If ANY waste (pure OR partial) exists → partial_waste (partially avoidable)
+            # - If NO waste (all justified/unknown) → justified
+            has_pure_waste = any(c == 'pure_waste' for c in upstream_classifications)
+            has_partial_waste = any(c == 'partial_waste' for c in upstream_classifications)
+            has_any_waste = has_pure_waste or has_partial_waste
+            has_justified = any(c == 'justified' for c in upstream_classifications)
+            has_unknown = any(c == 'unknown' for c in upstream_classifications)
+            
+            if all(c == 'pure_waste' for c in upstream_classifications):
+                # ALL upstream is pure waste → this is also pure waste (100% avoidable)
+                if current_classification != 'pure_waste':
+                    model['source_freshness_classification'] = 'pure_waste'
+                    model['waste_reason'] = 'cascaded_from_upstream_models'
+                    changed = True
+            elif has_any_waste and not has_unknown:
+                # Has some waste (pure or partial), may have justified too → partial waste
+                if current_classification != 'partial_waste':
+                    model['source_freshness_classification'] = 'partial_waste'
+                    model['waste_reason'] = 'mixed_upstream_dependencies'
+                    changed = True
+            elif has_justified and not has_any_waste and not has_unknown:
+                # Only justified upstream, no waste → justified
+                if current_classification != 'justified':
+                    model['source_freshness_classification'] = 'justified'
+                    model['waste_reason'] = 'justified_upstream_model'
+                    changed = True
+            elif has_unknown:
+                # Has unknown → stay unknown
+                if current_classification != 'unknown':
+                    model['source_freshness_classification'] = 'unknown'
+                    model['waste_reason'] = 'unknown_upstream_model'
+                    changed = True
+    
+    if iteration > 1:
+        print(f"  🔄 Cascaded waste classification through {iteration} levels of the DAG")
+    
+    # PHASE 3: Final cleanup - any remaining 'no_direct_sources' should be 'unknown'
+    for model in model_results:
+        if model.get('source_freshness_classification') == 'no_direct_sources':
+            model['source_freshness_classification'] = 'unknown'
+            model['waste_reason'] = 'unresolved_dependencies'
+    
+    return model_results
+
+
 def process_single_run_lightweight(api_base: str, api_key: str, account_id: str, run_id: int, 
                                     run_created: str, job_id: str = None, job_name: str = None, 
-                                    run_status: int = None):
+                                    run_status: int = None, staleness_threshold_seconds: int = 86400):
     """
     Lightweight version: Only fetches run_results and minimal manifest data for waste analysis.
+    Also fetches sources.json for source freshness classification.
     
     Uses STEP-BASED artifact fetching to ensure we get results from dbt run/build steps,
     NOT from dbt compile steps (which would show all models as "success" without actual execution).
@@ -1511,6 +1727,44 @@ def process_single_run_lightweight(api_base: str, api_key: str, account_id: str,
         
         print(f"✅ Run {run_id}: Found {len(all_results)} total results, now filtering to models...")
         
+        # STEP 3.5: Try to fetch sources.json for source freshness analysis
+        sources_freshness = None
+        
+        # First, look for dedicated `dbt source freshness` steps
+        source_freshness_step_ids = []
+        for step in run_steps:
+            step_name = step.get('name', '').lower()
+            step_index = step.get('index')
+            is_invoke_dbt = "invoke dbt" in step_name
+            has_source_freshness = "dbt source freshness" in step_name or "source freshness" in step_name
+            
+            if is_invoke_dbt and has_source_freshness:
+                source_freshness_step_ids.append(step_index)
+                print(f"  🔍 Found source freshness step: {step.get('name')} (index {step_index})")
+        
+        # Try source freshness steps first
+        for step_index in source_freshness_step_ids:
+            try:
+                sources_freshness = fetch_sources_json(api_base, api_key, account_id, run_id, step_index)
+                if sources_freshness:
+                    print(f"  ✅ Found sources.json in source freshness step {step_index}")
+                    break
+            except Exception as e:
+                continue
+        
+        # Fallback: try without step parameter (for 0-step runs)
+        if not sources_freshness and len(run_steps) == 0:
+            print(f"  📥 Trying sources.json without step parameter (0-step run)...")
+            try:
+                sources_freshness = fetch_sources_json(api_base, api_key, account_id, run_id, step_index=None)
+                if sources_freshness:
+                    print(f"  ✅ Found sources.json at run level (no step filtering)")
+            except Exception as e:
+                print(f"  ℹ️  sources.json not available at run level: {e}")
+        
+        if not sources_freshness:
+            print(f"  ℹ️  No sources.json found - source freshness classification unavailable")
+        
         # STEP 4: Fetch manifest for materialization lookup
         manifest_url = f'{api_base}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/manifest.json'
         response = requests.get(manifest_url, headers=headers)
@@ -1583,13 +1837,29 @@ def process_single_run_lightweight(api_base: str, api_key: str, account_id: str,
         
         print(f"✅ Run {run_id}: Extracted {len(models)} models from {len(all_results)} results")
         
+        # STEP 6: Link models to source freshness data
+        if sources_freshness and models:
+            print(f"  🔗 Linking {len(models)} models to source freshness data...")
+            print(f"  Sources in sources.json: {len(sources_freshness.get('results', []))}")
+            
+            models = link_models_to_sources(manifest, models, sources_freshness, staleness_threshold_seconds)
+            
+            # Debug: Show classification breakdown
+            classifications = {}
+            for model in models:
+                classification = model.get('source_freshness_classification', 'unknown')
+                classifications[classification] = classifications.get(classification, 0) + 1
+            
+            print(f"  ✅ Classification breakdown: {classifications}")
+        
         return {
             'run_id': run_id,
             'success': True,
             'models': models,
             'job_id': job_id,
             'job_name': job_name,
-            'run_status': run_status
+            'run_status': run_status,
+            'has_source_freshness': sources_freshness is not None
         }
         
     except Exception as e:
@@ -3257,6 +3527,17 @@ def show_pre_sao_waste_analysis():
             key="waste_credits"
         )
     
+    col6 = st.columns(1)[0]
+    with col6:
+        source_staleness_hours = st.number_input(
+            "Source Staleness Threshold (hours)",
+            min_value=1,
+            value=24,
+            step=1,
+            help="Sources older than this are considered 'stale'. Models that ran when ALL sources were stale are pure waste.",
+            key="waste_source_staleness"
+        )
+    
     # Job selection
     st.subheader("📋 Analysis Scope")
     
@@ -3614,10 +3895,13 @@ def show_pre_sao_waste_analysis():
                 'job_is_active': run.get('job_is_active', True)
             }
         
+        # Convert staleness threshold from hours to seconds
+        staleness_threshold_seconds = int(source_staleness_hours * 3600)
+        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_run = {
                 executor.submit(
-                    process_single_run_lightweight,  # Use lightweight version - no freshness configs needed!
+                    process_single_run_lightweight,
                     config['api_base'],
                     config['api_key'],
                     config['account_id'],
@@ -3625,7 +3909,8 @@ def show_pre_sao_waste_analysis():
                     run.get('created_at'),
                     run.get('job_definition_id'),
                     run.get('job_name', run.get('job', {}).get('name') if run.get('job') else None),
-                    run.get('status')
+                    run.get('status'),
+                    staleness_threshold_seconds  # Pass staleness threshold!
                 ): run.get('id') for run in runs
             }
             
@@ -3738,6 +4023,330 @@ def show_pre_sao_waste_analysis():
         # Calculate execution cost
         df['execution_time_hours'] = df['execution_time'] / 3600
         df['cost'] = df['execution_time_hours'] * cost_per_hour
+        
+        # ============================================================
+        # SOURCE FRESHNESS-BASED WASTE CLASSIFICATION (PRIMARY ROI)
+        # ============================================================
+        st.divider()
+        st.header("🎯 Source Freshness-Based Waste Classification")
+        st.markdown(f"""
+        **Pure Waste** = Models that ran when ALL upstream sources were stale (unchanged for >{source_staleness_hours}hrs).  
+        This represents the **strongest ROI for SAO** - these executions were 100% avoidable.
+        
+        **Classification Logic:**
+        - 🔴 **Pure Waste**: ALL upstream sources were stale → 100% avoidable with SAO
+        - 🟠 **Partial Waste**: Mixed dependencies (some stale, some fresh) → partially avoidable
+        - 🟢 **Justified**: At least one source was recently updated → Model correctly ran
+        - 🟡 **Unknown**: No source freshness data available (sources.json not found)
+        """)
+        
+        # Calculate classification metrics
+        if 'source_freshness_classification' in df.columns:
+            classification_counts = df['source_freshness_classification'].value_counts()
+            pure_waste_count = classification_counts.get('pure_waste', 0)
+            partial_waste_count = classification_counts.get('partial_waste', 0)
+            justified_count = classification_counts.get('justified', 0)
+            unknown_count = classification_counts.get('unknown', 0)
+            
+            total = len(df)
+            pure_waste_pct = (pure_waste_count / total * 100) if total > 0 else 0
+            partial_waste_pct = (partial_waste_count / total * 100) if total > 0 else 0
+            justified_pct = (justified_count / total * 100) if total > 0 else 0
+            unknown_pct = (unknown_count / total * 100) if total > 0 else 0
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric(
+                    "🔴 Pure Waste", 
+                    f"{pure_waste_count:,}", 
+                    delta=f"{pure_waste_pct:.1f}%",
+                    help="Models that ran when ALL upstream sources were stale (100% avoidable)"
+                )
+            
+            with col2:
+                st.metric(
+                    "🟠 Partial Waste", 
+                    f"{partial_waste_count:,}",
+                    delta=f"{partial_waste_pct:.1f}%",
+                    help="Models with mixed dependencies (some stale, some fresh)"
+                )
+            
+            with col3:
+                st.metric(
+                    "🟢 Justified", 
+                    f"{justified_count:,}",
+                    delta=f"{justified_pct:.1f}%",
+                    help="Models that ran with fresh upstream data"
+                )
+            
+            with col4:
+                st.metric(
+                    "🟡 Unknown", 
+                    f"{unknown_count:,}",
+                    delta=f"{unknown_pct:.1f}%",
+                    help="No source freshness data available"
+                )
+            
+            with col5:
+                # Calculate cost of pure + partial waste
+                waste_df = df[df['source_freshness_classification'].isin(['pure_waste', 'partial_waste'])]
+                total_waste_time_hours = waste_df['execution_time'].sum() / 3600
+                total_waste_wh_hours = total_waste_time_hours / num_threads
+                total_waste_cost = total_waste_wh_hours * cost_per_hour
+                st.metric(
+                    "💰 Total Waste Cost", 
+                    f"${total_waste_cost:,.2f}",
+                    help="Total cost of pure + partial waste"
+                )
+            
+            # Waste classification pie chart
+            st.subheader("📊 Classification Breakdown")
+            
+            classification_df = df.groupby('source_freshness_classification').agg({
+                'execution_time': 'sum'
+            }).reset_index()
+            
+            # Calculate cost for each classification
+            classification_df['cost'] = (classification_df['execution_time'] / 3600 / num_threads) * cost_per_hour
+            
+            # Rename for display
+            classification_map = {
+                'pure_waste': '🔴 Pure Waste (100% avoidable)',
+                'partial_waste': '🟠 Partial Waste (mixed dependencies)',
+                'justified': '🟢 Justified (needed)',
+                'unknown': '🟡 Unknown (no data)'
+            }
+            classification_df['category'] = classification_df['source_freshness_classification'].map(classification_map)
+            
+            fig = px.pie(
+                classification_df,
+                values='cost',
+                names='category',
+                title='Waste Classification by Source Freshness',
+                color='category',
+                color_discrete_map={
+                    '🔴 Pure Waste (100% avoidable)': '#ff6b6b',
+                    '🟠 Partial Waste (mixed dependencies)': '#ff922b',
+                    '🟢 Justified (needed)': '#51cf66',
+                    '🟡 Unknown (no data)': '#ffd43b'
+                }
+            )
+            
+            st.plotly_chart(fig, config={}, use_container_width=True)
+            
+            # ============================================================
+            # BY RUN: Models Executed - Wasted vs Not Wasted Per Run
+            # ============================================================
+            st.subheader("📈 Models Built: Wasted vs Not Wasted by Run")
+            st.caption("Shows which specific runs had waste - each bar represents one run")
+            
+            # Prepare per-run data
+            if 'run_id' in df.columns and 'source_freshness_classification' in df.columns:
+                # Group by run_id and classification
+                run_df = df.groupby(['run_id', 'source_freshness_classification']).size().reset_index(name='model_count')
+                
+                # Pivot to get waste vs not waste columns
+                run_pivot = run_df.pivot(
+                    index='run_id',
+                    columns='source_freshness_classification',
+                    values='model_count'
+                ).fillna(0.0).reset_index()
+                
+                # Ensure all columns exist
+                for col in ['pure_waste', 'partial_waste', 'justified', 'unknown']:
+                    if col not in run_pivot.columns:
+                        run_pivot[col] = 0.0
+                
+                # Calculate totals
+                run_pivot['wasted'] = run_pivot['pure_waste'] + run_pivot['partial_waste']
+                run_pivot['not_wasted'] = run_pivot['justified'] + run_pivot['unknown']
+                run_pivot['total'] = run_pivot['wasted'] + run_pivot['not_wasted']
+                run_pivot['waste_pct'] = (run_pivot['wasted'] / run_pivot['total'] * 100).round(1)
+                
+                # Get run metadata (job name, created_at) for better labels
+                run_metadata = df.groupby('run_id').agg({
+                    'run_created_at': 'first',
+                    'job_name': 'first'
+                }).reset_index()
+                
+                # Merge metadata
+                run_pivot = run_pivot.merge(run_metadata, on='run_id', how='left')
+                
+                # Sort by created_at (chronological)
+                run_pivot = run_pivot.sort_values('run_created_at')
+                
+                # Create labels: "Run #1", "Run #2", etc.
+                run_pivot['run_label'] = [f"Run #{i+1}" for i in range(len(run_pivot))]
+                
+                # Create stacked bar chart with 3 segments
+                fig_run = go.Figure()
+                
+                # Add "Not Wasted" bar (green - bottom of stack)
+                fig_run.add_trace(go.Bar(
+                    name='Not Wasted (Justified + Unknown)',
+                    x=run_pivot['run_label'],
+                    y=run_pivot['not_wasted'],
+                    marker_color='#51cf66',  # Green
+                    customdata=run_pivot[['run_id', 'job_name', 'run_created_at']],
+                    hovertemplate='<b>%{x}</b><br>' +
+                                  'Run ID: %{customdata[0]}<br>' +
+                                  'Job: %{customdata[1]}<br>' +
+                                  'Created: %{customdata[2]}<br>' +
+                                  'Not Wasted: %{y}<extra></extra>'
+                ))
+                
+                # Add "Partial Waste" bar (orange - middle of stack)
+                fig_run.add_trace(go.Bar(
+                    name='Partial Waste (Mixed)',
+                    x=run_pivot['run_label'],
+                    y=run_pivot['partial_waste'],
+                    marker_color='#ff922b',  # Orange
+                    customdata=run_pivot[['run_id', 'job_name', 'run_created_at']],
+                    hovertemplate='<b>%{x}</b><br>' +
+                                  'Run ID: %{customdata[0]}<br>' +
+                                  'Job: %{customdata[1]}<br>' +
+                                  'Created: %{customdata[2]}<br>' +
+                                  'Partial Waste: %{y}<extra></extra>'
+                ))
+                
+                # Add "Pure Waste" bar (red - top of stack)
+                fig_run.add_trace(go.Bar(
+                    name='Pure Waste (100% Avoidable)',
+                    x=run_pivot['run_label'],
+                    y=run_pivot['pure_waste'],
+                    marker_color='#ff6b6b',  # Red
+                    customdata=run_pivot[['run_id', 'job_name', 'run_created_at']],
+                    hovertemplate='<b>%{x}</b><br>' +
+                                  'Run ID: %{customdata[0]}<br>' +
+                                  'Job: %{customdata[1]}<br>' +
+                                  'Created: %{customdata[2]}<br>' +
+                                  'Pure Waste: %{y}<extra></extra>'
+                ))
+                
+                fig_run.update_layout(
+                    barmode='stack',
+                    title=f'Models Built by Run (Total: {len(run_pivot)} runs)',
+                    xaxis_title='Run',
+                    yaxis_title='Number of Model Executions',
+                    hovermode='x unified',
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="right",
+                        x=1
+                    ),
+                    xaxis={'tickangle': -45}  # Angle labels for readability
+                )
+                
+                st.plotly_chart(fig_run, config={}, use_container_width=True)
+                
+                # Show summary stats
+                total_pure_waste = run_pivot['pure_waste'].sum()
+                total_partial_waste = run_pivot['partial_waste'].sum()
+                total_wasted = total_pure_waste + total_partial_waste
+                total_not_wasted = run_pivot['not_wasted'].sum()
+                total_executions = total_wasted + total_not_wasted
+                waste_percentage = (total_wasted / total_executions * 100) if total_executions > 0 else 0
+                runs_with_waste = len(run_pivot[run_pivot['wasted'] > 0])
+                
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("Total Runs", f"{len(run_pivot):,}")
+                with col2:
+                    st.metric("🔴 Pure Waste", f"{int(total_pure_waste):,}", help="100% avoidable")
+                with col3:
+                    st.metric("🟠 Partial Waste", f"{int(total_partial_waste):,}", help="Partially avoidable")
+                with col4:
+                    st.metric("🟢 Not Wasted", f"{int(total_not_wasted):,}", help="Justified")
+                with col5:
+                    st.metric("Waste %", f"{waste_percentage:.1f}%", delta=f"{runs_with_waste}/{len(run_pivot)} runs")
+            else:
+                st.info("Run data not available")
+            
+            # ============================================================
+            # Pure waste details table
+            # ============================================================
+            st.subheader("🗑️ Pure Waste Model Details")
+            
+            # Get models that had any waste (pure or partial)
+            waste_models_df = df[df['source_freshness_classification'].isin(['pure_waste', 'partial_waste'])].copy() if 'source_freshness_classification' in df.columns else pd.DataFrame()
+            
+            if not waste_models_df.empty:
+                # Group by model and calculate stats
+                model_summary = df.groupby('unique_id').agg({
+                    'materialization': 'first',
+                    'unique_id': 'count'  # Total runs
+                }).rename(columns={'unique_id': 'total_runs'}).reset_index()
+                
+                # Count pure waste runs per model
+                pure_waste_counts = df[df['source_freshness_classification'] == 'pure_waste'].groupby('unique_id').size().reset_index(name='pure_waste_runs')
+                model_summary = model_summary.merge(pure_waste_counts, on='unique_id', how='left')
+                model_summary['pure_waste_runs'] = model_summary['pure_waste_runs'].fillna(0.0).astype(int)
+                
+                # Count partial waste runs per model
+                partial_waste_counts = df[df['source_freshness_classification'] == 'partial_waste'].groupby('unique_id').size().reset_index(name='partial_waste_runs')
+                model_summary = model_summary.merge(partial_waste_counts, on='unique_id', how='left')
+                model_summary['partial_waste_runs'] = model_summary['partial_waste_runs'].fillna(0.0).astype(int)
+                
+                # Calculate total wasted time (pure + partial waste only)
+                waste_time = df[df['source_freshness_classification'].isin(['pure_waste', 'partial_waste'])].groupby('unique_id')['execution_time'].sum().reset_index()
+                model_summary = model_summary.merge(waste_time, on='unique_id', how='left')
+                model_summary['execution_time'] = model_summary['execution_time'].fillna(0.0)
+                
+                # Calculate cost
+                model_summary['cost'] = (model_summary['execution_time'] / 3600 / num_threads) * cost_per_hour
+                
+                # Filter to models with any waste and sort by cost
+                model_summary = model_summary[
+                    (model_summary['pure_waste_runs'] > 0) | (model_summary['partial_waste_runs'] > 0)
+                ].sort_values('cost', ascending=False).head(30)
+                
+                st.markdown(f"**Top 30 Models with Waste** (pure or partial waste)")
+                
+                st.dataframe(
+                    model_summary,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        'unique_id': 'Model',
+                        'materialization': 'Type',
+                        'total_runs': st.column_config.NumberColumn('Total Runs', format='%d'),
+                        'pure_waste_runs': st.column_config.NumberColumn('🔴 Pure Waste Runs', format='%d'),
+                        'partial_waste_runs': st.column_config.NumberColumn('🟠 Partial Waste Runs', format='%d'),
+                        'execution_time': st.column_config.NumberColumn('Total Wasted Time (s)', format='%.1f'),
+                        'cost': st.column_config.NumberColumn('Wasted Cost ($)', format='$%.2f')
+                    }
+                )
+                
+                # ROI Insight
+                total_pure_cost = model_summary[model_summary['pure_waste_runs'] > 0]['cost'].sum()
+                st.success(f"""
+                **SAO Impact:** These models represent ${model_summary['cost'].sum():,.2f} in total waste 
+                (${total_pure_cost:,.2f} **pure waste** - 100% eliminable with SAO + source freshness checks).
+                """)
+            else:
+                st.info("No waste detected!")
+        else:
+            st.info(f"""
+            ℹ️ **Source freshness data unavailable**
+            
+            To enable this analysis, ensure your jobs run `dbt source freshness` commands. 
+            This allows us to identify models that ran when their upstream sources were stale (>{source_staleness_hours}hrs old).
+            
+            **How to enable:**
+            1. Add `dbt source freshness` step to your jobs
+            2. Configure freshness thresholds in your sources YAML
+            3. Re-run this analysis
+            """)
+        
+        # ============================================================
+        # ROW-BASED ANALYSIS (SUPPLEMENTARY)
+        # ============================================================
+        st.divider()
+        st.subheader("📦 Row-Based Waste Analysis (Supplementary)")
+        st.caption("Based on rows_affected: 'No New Data to Process' (0 rows) vs 'Processed New Data' (>0 rows)")
         
         # ============================================================
         # FRESHNESS STATUS SUMMARY (Matching Colleague's Pivot Table)
