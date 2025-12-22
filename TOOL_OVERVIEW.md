@@ -1,4 +1,4 @@
-# dbt Freshness & Run Status Analyzer - Tool Overview
+# dbt Fusion SAO Analyzer - Tool Overview
 
 ## 🎯 What It Is
 
