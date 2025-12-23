@@ -5,6 +5,12 @@ Usage:
     streamlit run streamlit_freshness_app.py
 """
 
+import warnings
+# Suppress all warnings before any other imports
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore')
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -17,7 +23,30 @@ from typing import List
 import plotly.express as px
 import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+import sys
+import os
 
+# Wrapper to suppress warnings during plotly chart rendering
+@contextmanager
+def suppress_warnings():
+    """Context manager to suppress all warnings during chart rendering"""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # Also suppress stderr temporarily to catch Plotly warnings
+        old_stderr = sys.stderr
+        sys.stderr = open(os.devnull, 'w')
+        try:
+            yield
+        finally:
+            sys.stderr.close()
+            sys.stderr = old_stderr
+
+# Wrapper function for plotly_chart that suppresses warnings
+def plotly_chart_no_warnings(fig, **kwargs):
+    """Wrapper around st.plotly_chart that suppresses deprecation warnings"""
+    with suppress_warnings():
+        st.plotly_chart(fig, **kwargs)
 
 # dbt Cloud run status codes
 RUN_STATUS_CODES = {
@@ -212,7 +241,7 @@ def get_all_runs_by_date(api_base: str, api_key: str, account_id: str,
                 'limit': page_limit,
                 'offset': offset,
                 'order_by': '-id',
-                'include_related': '["job","trigger","environment","repository"]',
+                'include_related': '["job","trigger","environment","repository","project"]',
                 'status': status_code,
                 'created_at__range': f'["{start_iso}","{end_iso}"]'  # SERVER-SIDE date filtering!
             }
@@ -397,7 +426,7 @@ def get_job_runs(api_base: str, api_key: str, account_id: str, job_id: str,
                 'offset': offset,
                 'order_by': '-id',
                 'job_definition_id': job_id,
-                'include_related': '["job","trigger","environment","repository"]',
+                'include_related': '["job","trigger","environment","repository","project"]',
             }
             
             if status:
@@ -441,7 +470,7 @@ def get_job_runs(api_base: str, api_key: str, account_id: str, job_id: str,
                 'offset': offset,
                 'order_by': '-id',
                 'job_definition_id': job_id,
-                'include_related': '["job","trigger","environment","repository"]',
+                'include_related': '["job","trigger","environment","repository","project"]',
                 'status': status_code
             }
             
@@ -1155,7 +1184,7 @@ def show_freshness_analysis():
             st.subheader("📈 Freshness Coverage by Resource Type")
             st.dataframe(
                 summary['by_resource'],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
             
@@ -1165,7 +1194,7 @@ def show_freshness_analysis():
                 st.markdown("*Packages are sorted by size (largest first = main project)*")
                 st.dataframe(
                     summary['by_package_resource'],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
             
@@ -1219,7 +1248,7 @@ def show_freshness_analysis():
                     height=400
                 )
                 
-                st.plotly_chart(fig, use_container_width=True)
+                plotly_chart_no_warnings(fig, use_container_width=True)
                 
                 # Show breakdown table
                 col1, col2 = st.columns(2)
@@ -1235,7 +1264,7 @@ def show_freshness_analysis():
                         values='Count',
                         title='Build After Configuration Distribution'
                     )
-                    st.plotly_chart(fig_pie, use_container_width=True)
+                    plotly_chart_no_warnings(fig_pie, use_container_width=True)
             else:
                 st.info("No models have freshness build_after configuration")
             
@@ -1342,13 +1371,13 @@ def show_freshness_analysis():
                         # Show the dataframe
                         st.dataframe(
                             project_df,
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True
                         )
             else:
                 st.dataframe(
                     display_df,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True
                 )
             
@@ -1867,7 +1896,8 @@ def process_single_run_lightweight(api_base: str, api_key: str, account_id: str,
 
 
 def process_single_run(api_base: str, api_key: str, account_id: str, run_id: int, run_created: str, 
-                       job_id: str = None, job_name: str = None, run_status: int = None):
+                       job_id: str = None, job_name: str = None, run_status: int = None,
+                       project_id: str = None, environment_id: str = None):
     """
     Process a single run to extract model status data (includes freshness configs).
     
@@ -1898,6 +1928,8 @@ def process_single_run(api_base: str, api_key: str, account_id: str, run_id: int
                     model['job_id'] = job_id
                     model['job_name'] = job_name
                     model['run_status'] = run_status
+                    model['project_id'] = project_id
+                    model['environment_id'] = environment_id
                     models.append(model)
                 return {
                     'run_id': run_id, 
@@ -2164,10 +2196,10 @@ def show_run_status_analysis():
             
         else:  # Specific Job ID
             fetch_limit = min(200, max_runs * 3)
-        runs = get_job_runs(
-            config['api_base'],
-            config['api_key'],
-            config['account_id'],
+            runs = get_job_runs(
+                config['api_base'],
+                config['api_key'],
+                config['account_id'],
                 job_id_input,
                 config.get('environment_id'),
                 limit=fetch_limit,
@@ -2254,7 +2286,9 @@ def show_run_status_analysis():
                     run.get('created_at'),
                     run.get('job_definition_id'),
                     run.get('job', {}).get('name') if run.get('job') else None,
-                    run.get('status')
+                    run.get('status'),
+                    run.get('project_id'),
+                    run.get('environment_id')
                 ): run.get('id') for run in runs
             }
             
@@ -2404,7 +2438,7 @@ def show_run_status_analysis():
             height=400
         )
         
-        st.plotly_chart(fig_trending, use_container_width=True)
+        plotly_chart_no_warnings(fig_trending, use_container_width=True)
         
         # Show statistics
         col1, col2, col3, col4 = st.columns(4)
@@ -2481,7 +2515,7 @@ def show_run_status_analysis():
             height=500
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        plotly_chart_no_warnings(fig, use_container_width=True)
         
         # Detailed breakdown table
         st.subheader("📋 Detailed Run Breakdown")
@@ -2495,7 +2529,9 @@ def show_run_status_analysis():
             'status': lambda x: x.value_counts().to_dict(),
             'job_id': 'first',
             'job_name': 'first',
-            'run_status': 'first'
+            'run_status': 'first',
+            'project_id': 'first',
+            'environment_id': 'first'
         }).reset_index()
         
         # Calculate execution time stats separately
@@ -2530,7 +2566,7 @@ def show_run_status_analysis():
             has_reuse_column = True
         
         # Format for display
-        display_columns = ['run_created_at', 'run_id', 'job_id', 'job_name', 'run_status_name', 'total'] + status_columns
+        display_columns = ['run_created_at', 'run_id', 'project_id', 'environment_id', 'job_id', 'job_name', 'run_status_name', 'total'] + status_columns
         if has_reuse_column:
             display_columns.append('reuse_rate_%')
         
@@ -2545,7 +2581,7 @@ def show_run_status_analysis():
         display_summary['median_exec_time'] = display_summary['median_exec_time'].round(3)
         
         # Set column names - must match display_columns order
-        new_column_names = ['Run Date', 'Run ID', 'Job ID', 'Job Name', 'Run Status', 'Total'] + [s.title() for s in status_columns]
+        new_column_names = ['Run Date', 'Run ID', 'Project ID', 'Environment ID', 'Job ID', 'Job Name', 'Run Status', 'Total'] + [s.title() for s in status_columns]
         if has_reuse_column:
             new_column_names.append('Reuse Rate %')
         new_column_names.extend(['Avg Time (s)', 'Median Time (s)'])
@@ -3104,7 +3140,9 @@ def show_cost_analysis():
                     run.get('created_at'),
                     run.get('job_definition_id'),
                     run.get('job', {}).get('name') if run.get('job') else None,
-                    run.get('status')
+                    run.get('status'),
+                    run.get('project_id'),
+                    run.get('environment_id')
                 ): run.get('id') for run in runs
             }
             
@@ -3288,7 +3326,7 @@ def show_cost_analysis():
             )
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        plotly_chart_no_warnings(fig, use_container_width=True)
         
         # TOP 20 MOST EXPENSIVE MODELS
         st.divider()
@@ -3315,7 +3353,7 @@ def show_cost_analysis():
         )
         
         fig_top.update_layout(height=600, showlegend=False)
-        st.plotly_chart(fig_top, use_container_width=True)
+        plotly_chart_no_warnings(fig_top, use_container_width=True)
         
         # DETAILED RUN BREAKDOWN
         st.divider()
@@ -4015,7 +4053,7 @@ def show_pre_sao_waste_analysis():
                     if inactive_jobs:
                         st.markdown("**Inactive/Deleted Jobs:**")
                         inactive_df = pd.DataFrame(inactive_jobs)
-                        st.dataframe(inactive_df, use_container_width=True, hide_index=True)
+                        st.dataframe(inactive_df, width="stretch", hide_index=True)
         
         # Convert run_created_at to datetime
         df['run_created_at'] = pd.to_datetime(df['run_created_at'])
@@ -4133,7 +4171,7 @@ def show_pre_sao_waste_analysis():
                 }
             )
             
-            st.plotly_chart(fig, config={}, use_container_width=True)
+            plotly_chart_no_warnings(fig, use_container_width=True)
             
             # ============================================================
             # BY RUN: Models Executed - Wasted vs Not Wasted Per Run
@@ -4240,7 +4278,7 @@ def show_pre_sao_waste_analysis():
                     xaxis={'tickangle': -45}  # Angle labels for readability
                 )
                 
-                st.plotly_chart(fig_run, config={}, use_container_width=True)
+                plotly_chart_no_warnings(fig_run, use_container_width=True)
                 
                 # Show summary stats
                 total_pure_waste = run_pivot['pure_waste'].sum()
@@ -4307,7 +4345,7 @@ def show_pre_sao_waste_analysis():
                 
                 st.dataframe(
                     model_summary,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     column_config={
                         'unique_id': 'Model',
@@ -4359,7 +4397,7 @@ def show_pre_sao_waste_analysis():
         analysis_df = df[df['materialization'] != 'view'].copy()
         
         # Classify by Freshness Status (based on rows_affected)
-        analysis_df['rows_affected_clean'] = analysis_df['rows_affected'].fillna(0).astype(float)
+        analysis_df['rows_affected_clean'] = pd.to_numeric(analysis_df['rows_affected'], errors='coerce').fillna(0.0)
         analysis_df['Freshness Status'] = analysis_df['rows_affected_clean'].apply(
             lambda x: 'No New Data to Process' if x == 0 else 'Processed New Data'
         )
@@ -4415,7 +4453,7 @@ def show_pre_sao_waste_analysis():
         # Display the pivot table
         st.dataframe(
             summary_with_total,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 'Freshness Status': st.column_config.TextColumn('Freshness Status', width='medium'),
@@ -4466,7 +4504,7 @@ def show_pre_sao_waste_analysis():
             model_pivot.columns = [f'{val} - {status}' for val, status in model_pivot.columns]
             model_pivot = model_pivot.reset_index()
             
-            st.dataframe(model_pivot, use_container_width=True, height=400)
+            st.dataframe(model_pivot, width="stretch", height=400)
         
         # Categorize waste
         df['waste_category'] = 'Not Waste'
@@ -4480,7 +4518,7 @@ def show_pre_sao_waste_analysis():
         executed_mask = (df['status'] == 'success') & (~view_mask)
         
         # 3. Clean rows_affected for analysis
-        df['rows_affected_clean'] = df['rows_affected'].fillna(0).astype(float)
+        df['rows_affected_clean'] = pd.to_numeric(df['rows_affected'], errors='coerce').fillna(0.0)
         
         # 4. Analyze patterns PER MODEL to categorize waste intelligently
         for unique_id in df[executed_mask]['unique_id'].unique():
@@ -4614,7 +4652,7 @@ def show_pre_sao_waste_analysis():
                 title='Wasted Cost by Category',
                 hole=0.4
             )
-            st.plotly_chart(fig, use_container_width=True)
+            plotly_chart_no_warnings(fig, use_container_width=True)
         
         with col2:
             # Waste by materialization
@@ -4634,7 +4672,7 @@ def show_pre_sao_waste_analysis():
                 text='Total Cost'
             )
             fig.update_traces(texttemplate='$%{text:.2f}', textposition='outside')
-            st.plotly_chart(fig, use_container_width=True)
+            plotly_chart_no_warnings(fig, use_container_width=True)
         
         # WASTE OVER TIME
         st.divider()
@@ -4675,7 +4713,7 @@ def show_pre_sao_waste_analysis():
             hovermode='x unified'
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        plotly_chart_no_warnings(fig, use_container_width=True)
         
         # TOP WASTERS
         st.divider()
@@ -4721,7 +4759,7 @@ def show_pre_sao_waste_analysis():
             hover_data=['Materialization', 'Waste Count', 'Run Count', 'Waste %', 'Avg Rows Changed', 'Avg Execution Time (s)']
         )
         fig.update_layout(height=600, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
+        plotly_chart_no_warnings(fig, use_container_width=True)
         
         # DETAILED TABLE
         st.divider()
@@ -4739,7 +4777,7 @@ def show_pre_sao_waste_analysis():
         
         st.dataframe(
             display_waste,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
         
@@ -4847,7 +4885,7 @@ def show_job_overlap_analysis():
     with col3:
         st.markdown("")
         st.markdown("")
-        analyze_button = st.button("🔍 Analyze All", type="primary", key="combined_analyze", use_container_width=True)
+        analyze_button = st.button("🔍 Analyze All", type="primary", key="combined_analyze", width="stretch")
     
     if not analyze_button:
         st.info("⬆️ Click 'Analyze All' to run SAO adoption and job overlap analysis")
@@ -4926,7 +4964,7 @@ def show_job_overlap_analysis():
                             color_discrete_map={'SAO-Enabled': '#10b981', 'Non-SAO': '#6b7280'},
                             hole=0.4
                         )
-                        st.plotly_chart(fig_pie, use_container_width=True)
+                        plotly_chart_no_warnings(fig_pie, use_container_width=True)
                     
                     with chart_col2:
                         # Job type breakdown
@@ -4954,7 +4992,7 @@ def show_job_overlap_analysis():
                             fig_bar.add_trace(go.Bar(name='SAO', x=breakdown_df['Job Type'], y=breakdown_df['SAO'], marker_color='#10b981'))
                             fig_bar.add_trace(go.Bar(name='Non-SAO', x=breakdown_df['Job Type'], y=breakdown_df['Non-SAO'], marker_color='#6b7280'))
                             fig_bar.update_layout(title='SAO by Job Type', barmode='group', height=300)
-                            st.plotly_chart(fig_bar, use_container_width=True)
+                            plotly_chart_no_warnings(fig_bar, use_container_width=True)
                     
                     # Non-SAO jobs list
                     non_sao_jobs = [{'Job ID': j['id'], 'Job Name': j['name'], 'Type': determine_job_type(j.get('triggers', {})).upper()} 
@@ -4962,7 +5000,7 @@ def show_job_overlap_analysis():
                     
                     if non_sao_jobs:
                         with st.expander(f"💡 {len(non_sao_jobs)} Jobs Without SAO"):
-                            st.dataframe(pd.DataFrame(non_sao_jobs), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(non_sao_jobs), width="stretch", hide_index=True)
                     
                     if sao_pct < 50:
                         st.warning(f"⚠️ Only {sao_pct:.1f}% of jobs have SAO enabled. Consider enabling SAO to reduce compute costs and avoid model overlap.")
@@ -5293,7 +5331,7 @@ def show_job_overlap_analysis():
             )
             
             fig_overlap.update_layout(height=600, showlegend=False)
-            st.plotly_chart(fig_overlap, use_container_width=True)
+            plotly_chart_no_warnings(fig_overlap, use_container_width=True)
             
             # Detailed table
             st.divider()
