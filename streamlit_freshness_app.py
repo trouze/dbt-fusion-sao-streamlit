@@ -4361,8 +4361,8 @@ def show_pre_sao_waste_analysis():
                 # ROI Insight
                 total_pure_cost = model_summary[model_summary['pure_waste_runs'] > 0]['cost'].sum()
                 st.success(f"""
-                **SAO Impact:** These models represent ${model_summary['cost'].sum():,.2f} in total waste 
-                (${total_pure_cost:,.2f} **pure waste** - 100% eliminable with SAO + source freshness checks).
+                **SAO Impact:** These models represent \\${model_summary['cost'].sum():,.2f} in total waste 
+                (\\${total_pure_cost:,.2f} **pure waste** - 100% eliminable with SAO + source freshness checks).
                 """)
             else:
                 st.info("No waste detected!")
