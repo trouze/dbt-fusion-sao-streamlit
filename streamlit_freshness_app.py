@@ -660,7 +660,7 @@ def calculate_summary_stats(results):
 
 def main():
     st.set_page_config(
-        page_title="dbt Freshness & Run Analyzer",
+        page_title="dbt Fusion SAO Status Analyzer",
         page_icon="🔍",
         layout="wide"
     )
@@ -676,7 +676,7 @@ def main():
             'configured': False
         }
     
-    st.title("🔍 dbt Freshness & Run Status Analyzer")
+    st.title("🔍 dbt Fusion SAO Status Analyzer")
     
     # Show configuration sidebar
     show_configuration_sidebar()
@@ -4328,6 +4328,16 @@ def show_pre_sao_waste_analysis():
                 model_summary = model_summary.merge(partial_waste_counts, on='unique_id', how='left')
                 model_summary['partial_waste_runs'] = model_summary['partial_waste_runs'].fillna(0.0).astype(int)
                 
+                # Count justified runs per model
+                justified_counts = df[df['source_freshness_classification'] == 'justified'].groupby('unique_id').size().reset_index(name='justified_runs')
+                model_summary = model_summary.merge(justified_counts, on='unique_id', how='left')
+                model_summary['justified_runs'] = model_summary['justified_runs'].fillna(0.0).astype(int)
+                
+                # Count unknown runs per model
+                unknown_counts = df[df['source_freshness_classification'] == 'unknown'].groupby('unique_id').size().reset_index(name='unknown_runs')
+                model_summary = model_summary.merge(unknown_counts, on='unique_id', how='left')
+                model_summary['unknown_runs'] = model_summary['unknown_runs'].fillna(0.0).astype(int)
+                
                 # Calculate total wasted time (pure + partial waste only)
                 waste_time = df[df['source_freshness_classification'].isin(['pure_waste', 'partial_waste'])].groupby('unique_id')['execution_time'].sum().reset_index()
                 model_summary = model_summary.merge(waste_time, on='unique_id', how='left')
@@ -4351,8 +4361,10 @@ def show_pre_sao_waste_analysis():
                         'unique_id': 'Model',
                         'materialization': 'Type',
                         'total_runs': st.column_config.NumberColumn('Total Runs', format='%d'),
-                        'pure_waste_runs': st.column_config.NumberColumn('🔴 Pure Waste Runs', format='%d'),
-                        'partial_waste_runs': st.column_config.NumberColumn('🟠 Partial Waste Runs', format='%d'),
+                        'pure_waste_runs': st.column_config.NumberColumn('🔴 Pure Waste', format='%d'),
+                        'partial_waste_runs': st.column_config.NumberColumn('🟠 Partial Waste', format='%d'),
+                        'justified_runs': st.column_config.NumberColumn('🟢 Justified', format='%d'),
+                        'unknown_runs': st.column_config.NumberColumn('🟡 Unknown', format='%d'),
                         'execution_time': st.column_config.NumberColumn('Total Wasted Time (s)', format='%.1f'),
                         'cost': st.column_config.NumberColumn('Wasted Cost ($)', format='$%.2f')
                     }
