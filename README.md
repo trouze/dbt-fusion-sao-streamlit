@@ -54,7 +54,7 @@ This will install:
 
 ```bash
 cd /path/to/dbt-fusion-sao-streamlit
-PYTHONDONTWRITEBYTECODE=1 python3 -m streamlit run streamlit_freshness_app.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m streamlit run app.py
 ```
 
 **Important**: Use `python3 -m streamlit` (not just `streamlit`) for proper import handling.
@@ -63,17 +63,34 @@ The app will open automatically in your browser at `http://localhost:8501`
 
 ### 3. Configure Your Credentials
 
+#### Option A: Environment Variables (Recommended)
+
+Set the following environment variables **or** create a `.env` file in the project root:
+
+```bash
+# .env (or export these in your shell)
+DBT_API_KEY=your_dbt_cloud_api_token
+DBT_ACCOUNT_ID=12345
+DBT_URL=https://cloud.getdbt.com          # optional, defaults to https://cloud.getdbt.com
+DBT_PROJECT_ID=67890                       # optional
+DBT_CLOUD_ENVIRONMENT_ID=11111             # optional
+```
+
+When `DBT_API_KEY` and `DBT_ACCOUNT_ID` are set, the app auto-configures on startup — no manual input needed.
+
+#### Option B: In-App Configuration
+
 1. Click on the **"⚙️ Configuration"** tab
-2. Enter your dbt Cloud credentials:
+2. Expand **"Credentials & Environment Settings"**
+3. Enter your dbt Cloud credentials:
    - **dbt Cloud URL**: e.g., `https://cloud.getdbt.com`
    - **API Key**: Your dbt Cloud API token (supports both REST and GraphQL)
    - **Account ID**: Your dbt Cloud account ID
-   - **Job ID**: Default job ID to analyze
    - **Project ID** (optional): For filtering
-   - **Environment ID** (optional): For GraphQL queries (Model Reuse & SLO Analysis)
-3. Click **"💾 Save Configuration"**
+   - **Environment ID** (optional): For environment-wide analysis
+4. Click **"Save Configuration"**
 
-You're ready to go! These credentials will be used across all tabs.
+Environment variables take precedence on first load. You can override them at any time via the in-app form.
 
 ## 📊 Features
 
@@ -307,7 +324,7 @@ ImportError: Error importing numpy...
 
 **Solution**: Make sure to use `python3 -m streamlit`:
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m streamlit run streamlit_freshness_app.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m streamlit run app.py
 ```
 
 ### "No runs found for job"
@@ -331,10 +348,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m streamlit run streamlit_freshness_app.py
 
 ## 📂 Files
 
-- **`streamlit_freshness_app.py`**: Main Streamlit application with all analysis tabs
+- **`app.py`**: Main Streamlit application with all analysis tabs
 - **`log_freshness.py`**: Core logic for fetching and processing dbt artifacts
-- **`log_freshness_from_job.py`**: Helper for fetching job runs
-- **`api_graphql_reused.py`**: Standalone script for GraphQL-based reuse analysis (also integrated into Streamlit app)
+- **`scripts/log_freshness_job.py`**: CLI helper for fetching and analyzing job runs
+- **`scripts/graphql_reuse.py`**: Standalone script for GraphQL-based reuse analysis (also integrated into Streamlit app)
 - **`requirements.txt`**: Python dependencies
 
 ## 🔗 dbt Cloud API
@@ -402,7 +419,7 @@ For issues or questions:
 
 ## 🔧 Standalone Script Usage
 
-The `api_graphql_reused.py` script can also be run independently for command-line analysis:
+The `scripts/graphql_reuse.py` script can also be run independently for command-line analysis:
 
 ```bash
 # Set environment variables
@@ -410,7 +427,7 @@ export DBT_CLOUD_API_KEY="your_api_key_here"
 export DBT_CLOUD_ENVIRONMENT_ID="672"
 
 # Run the script
-python3 api_graphql_reused.py
+python3 scripts/graphql_reuse.py
 ```
 
 This will fetch all models, calculate reuse statistics, and save results to CSV. However, the Streamlit app provides a much richer interactive experience with visualizations and filtering capabilities.

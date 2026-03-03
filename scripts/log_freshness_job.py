@@ -1,9 +1,9 @@
 """
-This script is a wrapper around log_freshness.py that accepts a job_id instead of run_id.
-It fetches the latest (or a specific) run from the job and then analyzes its freshness configuration.
+CLI wrapper around log_freshness.py that accepts a job_id instead of run_id.
+Fetches the latest (or a specific) run from the job and analyzes its freshness configuration.
 
 Usage:
-    python log_freshness_from_job.py
+    python scripts/log_freshness_job.py
 
 Environment variables required:
     - DBT_API_KEY: dbt Cloud API token
@@ -20,6 +20,9 @@ Environment variables required:
 import requests
 import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from log_freshness import DBTFreshnessLogger
 
 

@@ -113,7 +113,7 @@ Monitor State-Aware Orchestration rollout across jobs.
 
 ## 🎓 Getting Started (2 minutes)
 
-1. **Launch**: `streamlit run streamlit_freshness_app.py`
+1. **Launch**: `streamlit run app.py`
 2. **Configure**: Enter dbt Cloud URL, API Key, Account ID
 3. **Analyze**: Select a tab based on your goal
 4. **Export**: Download results as CSV for stakeholders

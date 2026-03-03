@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 **Option 2: Run manually**
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m streamlit run streamlit_freshness_app.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m streamlit run app.py
 ```
 
 ## Initial Setup in the App
@@ -117,11 +117,12 @@ dbt-fusion-sao-streamlit/
 ├── CHANGELOG.md                    # Version history
 ├── MODEL_REUSE_GUIDE.md           # Guide for new SLO Analysis tab
 ├── requirements.txt                # Python dependencies
-├── start.sh                        # Launch script
-├── streamlit_freshness_app.py     # Main Streamlit app (5 tabs)
+├── app.py                          # Main Streamlit app
 ├── log_freshness.py               # Core analysis logic
-├── log_freshness_from_job.py      # Job fetching helper
-├── api_graphql_reused.py          # Standalone GraphQL script
+├── scripts/
+│   ├── log_freshness_job.py       # CLI: job fetching helper
+│   └── graphql_reuse.py           # CLI: standalone GraphQL script
+├── start.sh                        # Launch script
 └── .gitignore                     # Prevent committing secrets
 ```
 

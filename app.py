@@ -2,7 +2,7 @@
 Streamlit application for analyzing dbt freshness configuration.
 
 Usage:
-    streamlit run streamlit_freshness_app.py
+    streamlit run app.py
 """
 
 import warnings
@@ -26,6 +26,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import sys
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Wrapper to suppress warnings during plotly chart rendering
 @contextmanager
@@ -665,15 +668,19 @@ def main():
         layout="wide"
     )
     
-    # Initialize session state for configuration
+    # Initialize session state for configuration, preferring environment variables
     if 'config' not in st.session_state:
+        env_api_key = os.getenv('DBT_API_KEY', '')
+        env_account_id = os.getenv('DBT_ACCOUNT_ID', '')
+        env_configured = bool(env_api_key and env_account_id)
         st.session_state.config = {
-            'api_base': 'https://cloud.getdbt.com',
-            'api_key': '',
-            'account_id': '',
-            'project_id': '',
-            'environment_id': '',
-            'configured': False
+            'api_base': os.getenv('DBT_URL', 'https://cloud.getdbt.com'),
+            'api_key': env_api_key,
+            'account_id': env_account_id,
+            'project_id': os.getenv('DBT_PROJECT_ID', ''),
+            'environment_id': os.getenv('DBT_CLOUD_ENVIRONMENT_ID', ''),
+            'configured': env_configured,
+            'from_env': env_configured,
         }
     
     st.title("🔍 dbt Fusion SAO Status Analyzer")
@@ -683,45 +690,46 @@ def main():
     
     # Create tabs for different pages
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "⚙️ Configuration",
         "🗑️ Pre-SAO Waste Analysis",
         "🔀 Job Overlap Analysis",
-        "📋 Model Details", 
+        "📋 Model Details",
         "📈 Historical Trends",
-        "💰 Cost Analysis"
+        "💰 Cost Analysis",
+        "⚙️ Configuration"
     ])
     
     with tab1:
-        show_configuration_page()
-    
-    with tab2:
         show_pre_sao_waste_analysis()
     
-    with tab3:
+    with tab2:
         show_job_overlap_analysis()
     
-    with tab4:
+    with tab3:
         show_freshness_analysis()
     
-    with tab5:
+    with tab4:
         show_run_status_analysis()
     
-    with tab6:
+    with tab5:
         show_cost_analysis()
+    
+    with tab6:
+        show_configuration_page()
 
 
 def show_configuration_sidebar():
     """Show minimal configuration status in sidebar."""
     with st.sidebar:
         st.header("⚙️ Configuration")
-        
+
         if st.session_state.config['configured']:
-            st.success("✅ Configured")
+            source = "env" if st.session_state.config.get('from_env') else "manual"
+            st.success(f"✅ Configured ({source})")
             st.caption(f"Account: {st.session_state.config['account_id']}")
             if st.session_state.config.get('environment_id'):
                 st.caption(f"Environment: {st.session_state.config['environment_id']}")
-            
-            if st.button("🔄 Reconfigure", width='stretch'):
+
+            if st.button("🔄 Reconfigure", use_container_width=True):
                 st.session_state.config['configured'] = False
                 st.rerun()
         else:
@@ -732,91 +740,106 @@ def show_configuration_sidebar():
 def show_configuration_page():
     """Show configuration page for setting up credentials and common settings."""
     st.header("⚙️ Configuration")
-    st.markdown("Set up your dbt Cloud credentials and environment settings. These will be used across all analysis pages.")
-    
-    st.divider()
-    
-    # Configuration first (at the top)
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🔐 dbt Cloud Credentials")
-        
-        api_base = st.text_input(
-            "dbt Cloud URL",
-            value=st.session_state.config['api_base'],
-            help="Base URL for dbt Cloud instance (e.g., https://cloud.getdbt.com or https://vu491.us1.dbt.com - no trailing slash)",
-            key="config_api_base"
+
+    from_env = st.session_state.config.get('from_env', False)
+
+    if from_env:
+        st.success(
+            "Configuration loaded from environment variables. "
+            "Set `DBT_API_KEY`, `DBT_ACCOUNT_ID`, `DBT_URL`, `DBT_PROJECT_ID`, "
+            "and `DBT_CLOUD_ENVIRONMENT_ID` in your environment or a `.env` file."
         )
-        
-        api_key = st.text_input(
-            "API Key",
-            value=st.session_state.config['api_key'],
-            type="password",
-            help="dbt Cloud API token (keep this secret!)",
-            key="config_api_key"
+        st.caption("Expand the section below to view or override the current values.")
+    else:
+        st.markdown("Set up your dbt Cloud credentials and environment settings. These will be used across all analysis pages.")
+        st.info(
+            "**Tip:** You can also set these via environment variables or a `.env` file to skip this step. "
+            "Supported variables: `DBT_API_KEY`, `DBT_ACCOUNT_ID`, `DBT_URL`, `DBT_PROJECT_ID`, `DBT_CLOUD_ENVIRONMENT_ID`."
         )
-        
-        account_id = st.text_input(
-            "Account ID",
-            value=st.session_state.config['account_id'],
-            help="Your dbt Cloud account ID",
-            key="config_account_id"
-        )
-    
-    with col2:
-        st.subheader("🎯 Environment Settings")
-        
-        environment_id = st.text_input(
-            "Environment ID (Optional)",
-            value=st.session_state.config.get('environment_id', ''),
-            help="dbt Cloud environment ID for environment-wide analysis",
-            key="config_environment_id"
-        )
-        
-        project_id = st.text_input(
-            "Project ID (Optional)",
-            value=st.session_state.config.get('project_id', ''),
-            help="dbt Cloud project ID for filtering",
-            key="config_project_id"
-        )
-    
-    st.divider()
-    
-    col1, col2, col3 = st.columns([1, 1, 2])
-    
-    with col1:
-        if st.button("💾 Save Configuration", type="primary", width='stretch'):
-            if not api_key or not account_id:
-                st.error("❌ API Key and Account ID are required")
-            else:
+
+    expand_default = not st.session_state.config['configured']
+    with st.expander("Credentials & Environment Settings", expanded=expand_default):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("dbt Cloud Credentials")
+
+            api_base = st.text_input(
+                "dbt Cloud URL",
+                value=st.session_state.config['api_base'],
+                help="Base URL for dbt Cloud instance (e.g., https://cloud.getdbt.com or https://vu491.us1.dbt.com - no trailing slash)",
+                key="config_api_base"
+            )
+
+            api_key = st.text_input(
+                "API Key",
+                value=st.session_state.config['api_key'],
+                type="password",
+                help="dbt Cloud API token (keep this secret!)",
+                key="config_api_key"
+            )
+
+            account_id = st.text_input(
+                "Account ID",
+                value=st.session_state.config['account_id'],
+                help="Your dbt Cloud account ID",
+                key="config_account_id"
+            )
+
+        with col2:
+            st.subheader("Environment Settings")
+
+            environment_id = st.text_input(
+                "Environment ID (Optional)",
+                value=st.session_state.config.get('environment_id', ''),
+                help="dbt Cloud environment ID for environment-wide analysis",
+                key="config_environment_id"
+            )
+
+            project_id = st.text_input(
+                "Project ID (Optional)",
+                value=st.session_state.config.get('project_id', ''),
+                help="dbt Cloud project ID for filtering",
+                key="config_project_id"
+            )
+
+        st.divider()
+
+        col1, col2, col3 = st.columns([1, 1, 2])
+
+        with col1:
+            if st.button("Save Configuration", type="primary", use_container_width=True):
+                if not api_key or not account_id:
+                    st.error("API Key and Account ID are required")
+                else:
+                    st.session_state.config = {
+                        'api_base': api_base.rstrip('/'),
+                        'api_key': api_key,
+                        'account_id': account_id,
+                        'project_id': project_id,
+                        'environment_id': environment_id,
+                        'configured': True,
+                        'from_env': False,
+                    }
+                    st.success("Configuration saved!")
+                    st.rerun()
+
+        with col2:
+            if st.button("Clear Configuration", use_container_width=True):
                 st.session_state.config = {
-                    'api_base': api_base.rstrip('/'),  # Strip trailing slash to avoid double slashes in URLs
-                    'api_key': api_key,
-                    'account_id': account_id,
-                    'project_id': project_id,
-                    'environment_id': environment_id,
-                    'configured': True
+                    'api_base': 'https://cloud.getdbt.com',
+                    'api_key': '',
+                    'account_id': '',
+                    'project_id': '',
+                    'environment_id': '',
+                    'configured': False,
+                    'from_env': False,
                 }
-                st.success("✅ Configuration saved!")
+                st.success("Configuration cleared!")
                 st.rerun()
-    
-    with col2:
-        if st.button("🔄 Clear Configuration", width='stretch'):
-            st.session_state.config = {
-                'api_base': 'https://cloud.getdbt.com',
-                'api_key': '',
-                'account_id': '',
-                'project_id': '',
-                'environment_id': '',
-                'configured': False
-            }
-            st.success("✅ Configuration cleared!")
-            st.rerun()
-    
-    # Show current status
+
     if st.session_state.config['configured']:
-        st.success("✅ Configuration is saved and ready to use")
+        st.success("Configuration is saved and ready to use")
         st.info("💡 **Tip**: Environment ID is used for Environment Overview and Job Overlap Analysis. Other tabs let you specify job/run details.")
     else:
         st.warning("⚠️ **Please configure your credentials to start analyzing**")
@@ -885,7 +908,7 @@ def show_freshness_analysis():
     
     # Check if configured
     if not st.session_state.config['configured']:
-        st.warning("⚠️ Please configure your settings in the Configuration tab first")
+        st.warning("⚠️ Not configured. Set `DBT_API_KEY` and `DBT_ACCOUNT_ID` in a `.env` file, or go to the **⚙️ Configuration** tab.")
         return
     
     config = st.session_state.config
@@ -1954,7 +1977,7 @@ def show_run_status_analysis():
     
     # Check if configured
     if not st.session_state.config['configured']:
-        st.warning("⚠️ Please configure your settings in the Configuration tab first")
+        st.warning("⚠️ Not configured. Set `DBT_API_KEY` and `DBT_ACCOUNT_ID` in a `.env` file, or go to the **⚙️ Configuration** tab.")
         return
     
     config = st.session_state.config
@@ -2720,7 +2743,7 @@ def show_cost_analysis():
     
     # Check if configured
     if not st.session_state.config['configured']:
-        st.warning("⚠️ Please configure your settings in the Configuration tab first")
+        st.warning("⚠️ Not configured. Set `DBT_API_KEY` and `DBT_ACCOUNT_ID` in a `.env` file, or go to the **⚙️ Configuration** tab.")
         return
     
     config = st.session_state.config
@@ -3447,7 +3470,7 @@ def show_pre_sao_waste_analysis():
     
     # Check if configured
     if not st.session_state.config['configured']:
-        st.warning("⚠️ Please configure your settings in the Configuration tab first")
+        st.warning("⚠️ Not configured. Set `DBT_API_KEY` and `DBT_ACCOUNT_ID` in a `.env` file, or go to the **⚙️ Configuration** tab.")
         return
     
     config = st.session_state.config
@@ -4838,7 +4861,7 @@ def show_job_overlap_analysis():
     
     # Check if configured
     if not st.session_state.config['configured']:
-        st.warning("⚠️ Please configure your settings in the Configuration tab first")
+        st.warning("⚠️ Not configured. Set `DBT_API_KEY` and `DBT_ACCOUNT_ID` in a `.env` file, or go to the **⚙️ Configuration** tab.")
         return
     
     config = st.session_state.config

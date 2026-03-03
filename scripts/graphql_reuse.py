@@ -2,7 +2,7 @@
 GraphQL API script for fetching dbt Cloud model execution data and analyzing reuse rates.
 
 NOTE: This functionality has been integrated into the Streamlit app!
-      Run 'streamlit run streamlit_freshness_app.py' and go to the 
+      Run 'streamlit run app.py' and go to the
       "🔄 Model Reuse & SLO Analysis" tab for an interactive version.
 
 This standalone script can still be used for command-line analysis.
@@ -185,7 +185,7 @@ if __name__ == "__main__":
 
     print("\n" + "="*60)
     print("NOTE: For more detailed analysis with visualizations,")
-    print("use the Streamlit app: streamlit run streamlit_freshness_app.py")
+    print("use the Streamlit app: streamlit run app.py")
     print("Navigate to the '🔄 Model Reuse & SLO Analysis' tab")
     print("="*60)
 
